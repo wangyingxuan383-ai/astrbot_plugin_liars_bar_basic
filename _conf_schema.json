@@ -2,13 +2,13 @@
   "play_timeout_seconds": {
     "description": "出牌超时秒数",
     "type": "int",
-    "default": 90,
+    "default": 120,
     "hint": "当前行动玩家在私聊提交 /酒馆 出 的超时秒数，超时直接整局淘汰"
   },
   "wire_timeout_seconds": {
     "description": "剪线超时秒数",
     "type": "int",
-    "default": 60,
+    "default": 120,
     "hint": "待剪线玩家在群内提交 /酒馆 剪线 的超时秒数，超时将自动随机剪线"
   },
   "guide_mode": {

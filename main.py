@@ -54,6 +54,16 @@ WIRE_ALIASES = {
     "y": WIRE_YELLOW,
 }
 
+DEFAULT_PLAY_TIMEOUT_SECONDS = 120
+DEFAULT_WIRE_TIMEOUT_SECONDS = 120
+FIXED_HAND_SIZE = 5
+DECK_DISTRIBUTION_WEIGHTS = {
+    CARD_SUN: 3,
+    CARD_MOON: 3,
+    CARD_STAR: 3,
+    CARD_MAGIC: 1,
+}
+
 PHASE_WAITING = "waiting"
 PHASE_PLAYING = "playing"
 PHASE_AWAIT_WIRE = "await_wire"
@@ -155,6 +165,10 @@ class RoomState:
     pending_wire_user_id: str = ""
     wire_options: list[str] = field(default_factory=list)
     wire_index_map: dict[str, str] = field(default_factory=dict)
+    initial_player_count: int = 0
+    fixed_hand_size: int = FIXED_HAND_SIZE
+    round_deck_total: int = 0
+    round_deck_counts: dict[str, int] = field(default_factory=dict)
     play_deadline_ts: float = 0.0
     wire_deadline_ts: float = 0.0
     action_token: int = 0
@@ -185,6 +199,10 @@ class RoomState:
             "pending_wire_user_id": self.pending_wire_user_id,
             "wire_options": self.wire_options,
             "wire_index_map": self.wire_index_map,
+            "initial_player_count": self.initial_player_count,
+            "fixed_hand_size": self.fixed_hand_size,
+            "round_deck_total": self.round_deck_total,
+            "round_deck_counts": self.round_deck_counts,
             "play_deadline_ts": self.play_deadline_ts,
             "wire_deadline_ts": self.wire_deadline_ts,
             "action_token": self.action_token,
@@ -212,6 +230,10 @@ class RoomState:
             pending_wire_user_id=str(data.get("pending_wire_user_id", "")),
             wire_options=list(data.get("wire_options", []) or []),
             wire_index_map=dict(data.get("wire_index_map", {}) or {}),
+            initial_player_count=int(data.get("initial_player_count", 0)),
+            fixed_hand_size=int(data.get("fixed_hand_size", FIXED_HAND_SIZE)),
+            round_deck_total=int(data.get("round_deck_total", 0)),
+            round_deck_counts=dict(data.get("round_deck_counts", {}) or {}),
             play_deadline_ts=float(data.get("play_deadline_ts", 0.0)),
             wire_deadline_ts=float(data.get("wire_deadline_ts", 0.0)),
             action_token=int(data.get("action_token", 0)),
@@ -306,7 +328,7 @@ class AssetRenderer:
 
         draw = ImageDraw.Draw(canvas)
         title_font = self._pick_font(24)
-        idx_font = self._pick_font(28)
+        idx_font = self._pick_number_font(28)
 
         draw.text((padding, 4), "你的手牌（序号用于 /酒馆 出）", fill=(233, 237, 245, 255), font=title_font)
 
@@ -319,7 +341,14 @@ class AssetRenderer:
             idx_text = str(i + 1)
             tw = self._text_width(draw, idx_text, idx_font)
             draw.rounded_rectangle((x, y, x + max(36, tw + 20), y + 30), radius=10, fill=(45, 53, 75, 220))
-            draw.text((x + 10, y + 4), idx_text, fill=(255, 255, 255, 255), font=idx_font)
+            draw.text(
+                (x + 10, y + 4),
+                idx_text,
+                fill=(255, 255, 255, 255),
+                font=idx_font,
+                stroke_width=1,
+                stroke_fill=(0, 0, 0, 220),
+            )
 
         safe_room_id = str(abs(hash(room_id)))
         out = self.cache_dir / f"hand_{safe_room_id}_{user_id}_{int(time.time() * 1000)}.png"
@@ -501,6 +530,22 @@ class AssetRenderer:
         candidates = [
             "/root/AstrBot/data/plugins/astrbot_plugin_gaokao_sim/assets/fonts/SourceHanSansSC-Regular.otf",
             "/root/AstrBot/data/plugins/astrbot_plugin_parser/core/resources/HYSongYunLangHeiW-1.ttf",
+            "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+            "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        ]
+        for path in candidates:
+            if os.path.exists(path):
+                try:
+                    return ImageFont.truetype(path, size=size)
+                except Exception:
+                    continue
+        return ImageFont.load_default()
+
+    @staticmethod
+    def _pick_number_font(size: int) -> ImageFont.ImageFont:
+        candidates = [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         ]
@@ -560,6 +605,66 @@ class LiarsBarBasicPlugin(Star):
             task.cancel()
         self.play_timeout_tasks.clear()
         self.wire_timeout_tasks.clear()
+
+    def _play_timeout_seconds(self) -> int:
+        return max(1, int(self.conf.get("play_timeout_seconds", DEFAULT_PLAY_TIMEOUT_SECONDS)))
+
+    def _wire_timeout_seconds(self) -> int:
+        return max(1, int(self.conf.get("wire_timeout_seconds", DEFAULT_WIRE_TIMEOUT_SECONDS)))
+
+    def _build_locked_deck_counts(self, start_player_count: int) -> dict[str, int]:
+        # Lock total cards at game start: players * 5.
+        players = max(3, min(5, int(start_player_count)))
+        total = players * FIXED_HAND_SIZE
+        weights = DECK_DISTRIBUTION_WEIGHTS
+        cards = [CARD_SUN, CARD_MOON, CARD_STAR, CARD_MAGIC]
+        weight_sum = sum(weights.values())
+
+        raw: dict[str, float] = {}
+        counts: dict[str, int] = {}
+        for card in cards:
+            value = total * (weights[card] / weight_sum)
+            raw[card] = value
+            counts[card] = int(value)
+
+        remain = total - sum(counts.values())
+        order = sorted(cards, key=lambda c: (raw[c] - counts[c]), reverse=True)
+        idx = 0
+        while remain > 0:
+            counts[order[idx % len(order)]] += 1
+            idx += 1
+            remain -= 1
+        return counts
+
+    def _build_round_deck(self, room: RoomState) -> list[str]:
+        counts = room.round_deck_counts or self._build_locked_deck_counts(room.initial_player_count or len(room.order) or 4)
+        deck = (
+            [CARD_SUN] * int(counts.get(CARD_SUN, 0))
+            + [CARD_MOON] * int(counts.get(CARD_MOON, 0))
+            + [CARD_STAR] * int(counts.get(CARD_STAR, 0))
+            + [CARD_MAGIC] * int(counts.get(CARD_MAGIC, 0))
+        )
+        random.shuffle(deck)
+        return deck
+
+    def _card_pool_text(self, room: RoomState) -> str:
+        hand_size = max(1, int(room.fixed_hand_size or FIXED_HAND_SIZE))
+        counts = room.round_deck_counts or self._build_locked_deck_counts(room.initial_player_count or len(room.order) or 4)
+        total = int(room.round_deck_total or sum(int(v) for v in counts.values()))
+        alive_n = len(room.alive_ids())
+        used = hand_size * alive_n
+        remain = max(0, total - used)
+        return (
+            f"本大局锁定卡池：共 {total} 张（太阳×{int(counts.get(CARD_SUN, 0))}  月亮×{int(counts.get(CARD_MOON, 0))}  星星×{int(counts.get(CARD_STAR, 0))}  魔术×{int(counts.get(CARD_MAGIC, 0))}）"
+            f"\n开局人数 {room.initial_player_count}，当前存活 {alive_n} 人；每位存活玩家固定发 {hand_size} 张，本小局未发 {remain} 张。"
+        )
+
+    def _room_create_card_intro(self) -> str:
+        return (
+            "发牌规则：每小局先清空上局手牌，再给当前存活玩家每人固定发 5 张。"
+            "\n卡池规则：在 /酒馆 开始 时按开局人数一次锁定总牌数（3人=15张，4人=20张，5人=25张），后续小局不再改变。"
+            "\n牌型按比例分配（太阳/月亮/星星/魔术=3/3/3/1），保证每局结构稳定。"
+        )
 
     @filter.command("酒馆", alias={"骗子酒馆", "liarsbar"})
     async def liars_bar(self, event: AstrMessageEvent):
@@ -623,6 +728,35 @@ class LiarsBarBasicPlugin(Star):
             await event.send(event.plain_result(self._private_help_text()))
             return
 
+        if cmd in {
+            "开房",
+            "创建",
+            "create",
+            "加入",
+            "join",
+            "开始",
+            "start",
+            "状态",
+            "status",
+            "查看",
+            "质疑",
+            "liar",
+            "call",
+            "剪线",
+            "cut",
+            "wire",
+            "结束",
+            "关闭",
+            "end",
+            "exit",
+        }:
+            text = self._guide(
+                "这些命令只能在群聊中使用，私聊只支持“手牌/出牌”。",
+                "请回到房间所在群发送对应群指令。",
+            )
+            await event.send(event.plain_result(text))
+            return
+
         if cmd in {"手牌", "cards", "hand"}:
             await self._cmd_private_hand(event)
             return
@@ -681,7 +815,7 @@ class LiarsBarBasicPlugin(Star):
             await self._save_state_locked()
 
         msg = self._guide(
-            f"开房成功。你是房主，当前 1/5 人。",
+            f"开房成功。你是房主，当前 1/5 人。\n{self._room_create_card_intro()}",
             "让其他人发送 /酒馆 加入；人数达到 3~5 人后你发送 /酒馆 开始。",
         )
         await event.send(event.plain_result(msg))
@@ -796,6 +930,10 @@ class LiarsBarBasicPlugin(Star):
             room.pending_wire_user_id = ""
             room.wire_options = []
             room.wire_index_map = {}
+            room.initial_player_count = len(room.order)
+            room.fixed_hand_size = FIXED_HAND_SIZE
+            room.round_deck_counts = self._build_locked_deck_counts(room.initial_player_count)
+            room.round_deck_total = sum(room.round_deck_counts.values())
             room.play_deadline_ts = 0
             room.wire_deadline_ts = 0
 
@@ -1059,7 +1197,7 @@ class LiarsBarBasicPlugin(Star):
             room.wire_index_map = {}
             room.wire_deadline_ts = 0
             room.action_token += 1
-            room.play_deadline_ts = time.time() + int(self.conf.get("play_timeout_seconds", 90))
+            room.play_deadline_ts = time.time() + self._play_timeout_seconds()
             self._arm_play_timeout_task(room.room_id, room.action_token, room.current_turn_user_id, room.play_deadline_ts)
 
             await self._send_private_hand(room, user_id, force_tip=True)
@@ -1109,7 +1247,7 @@ class LiarsBarBasicPlugin(Star):
         self._cancel_play_timeout_task(room.room_id)
 
         room.action_token += 1
-        room.wire_deadline_ts = time.time() + int(self.conf.get("wire_timeout_seconds", 60))
+        room.wire_deadline_ts = time.time() + self._wire_timeout_seconds()
         self._arm_wire_timeout_task(room.room_id, room.action_token, punished_id, room.wire_deadline_ts)
 
         options_text = " / ".join([f"{k}={v}" for k, v in room.wire_index_map.items()])
@@ -1185,10 +1323,20 @@ class LiarsBarBasicPlugin(Star):
             await self._announce_winner_and_close_locked(room, reason="仅剩一名玩家")
             return
 
-        deck = [CARD_SUN] * 6 + [CARD_MOON] * 6 + [CARD_STAR] * 6 + [CARD_MAGIC] * 2
-        random.shuffle(deck)
-        hand_size = max(1, len(deck) // len(alive_ids))
+        for uid in room.order:
+            if uid in room.players:
+                room.players[uid].hand = []
 
+        hand_size = max(1, int(room.fixed_hand_size or FIXED_HAND_SIZE))
+        deck = self._build_round_deck(room)
+        need = hand_size * len(alive_ids)
+        if len(deck) < need:
+            await self._send_group_text(
+                room,
+                self._guide("牌池数据异常，无法继续发牌，已终止本局。", "请重新发送 /酒馆 开房。"),
+            )
+            self._drop_room_locked(room.room_id)
+            return
         for uid in alive_ids:
             take = deck[:hand_size]
             deck = deck[hand_size:]
@@ -1208,14 +1356,15 @@ class LiarsBarBasicPlugin(Star):
         room.wire_deadline_ts = 0
 
         room.action_token += 1
-        room.play_deadline_ts = time.time() + int(self.conf.get("play_timeout_seconds", 90))
+        room.play_deadline_ts = time.time() + self._play_timeout_seconds()
         self._arm_play_timeout_task(room.room_id, room.action_token, starter, room.play_deadline_ts)
         self._cancel_wire_timeout_task(room.room_id)
 
         target_name = CARD_NAME.get(room.target_card, room.target_card)
         starter_name = room.players.get(starter).name if starter in room.players else starter
 
-        chain: list[Any] = [Comp.Plain(f"第 {room.round_no} 小局开始（{reason}）。目标牌：{target_name}\n")]
+        pool_text = self._card_pool_text(room)
+        chain: list[Any] = [Comp.Plain(f"第 {room.round_no} 小局开始（{reason}）。目标牌：{target_name}\n{pool_text}\n")]
         target_img = self.renderer.target_path(room.target_card)
         if target_img.exists():
             chain.append(Comp.Image.fromFileSystem(str(target_img)))
@@ -1303,12 +1452,18 @@ class LiarsBarBasicPlugin(Star):
             return False
 
     async def _send_rules_forward(self, room: RoomState) -> None:
+        pool_text = self._card_pool_text(room)
+        play_timeout = self._play_timeout_seconds()
+        wire_timeout = self._wire_timeout_seconds()
         sections = [
-            "【酒馆基础规则】\n1) 每小局会随机目标牌（太阳/月亮/星星）\n2) 出牌在私聊完成，群里只公布宣称数量",
+            "【酒馆基础规则】\n1) 每小局随机目标牌（太阳/月亮/星星），并给当前存活玩家每人固定发 5 张",
+            "2) 出牌在私聊完成，群里只公布宣称数量",
             "3) 质疑规则：下一位可在群里 /酒馆 质疑\n4) 判定规则：暗牌中“任一假即判假”，魔术牌可当目标牌",
             "5) 受罚进入剪线：三选一 -> 二选一 -> 一选一必爆\n6) 命令：/酒馆 剪线 红|蓝|黄（支持数字）",
-            "7) 超时：出牌90秒超时直接整局淘汰\n8) 若玩家出完手牌，下家会被系统自动触发质疑",
+            f"7) 超时：出牌{play_timeout}秒超时直接整局淘汰；剪线{wire_timeout}秒超时自动剪线",
+            "8) 若玩家出完手牌，下家会被系统自动触发质疑",
             "9) 全程一人一房，避免私聊串局\n10) 所有命令可随时用 /酒馆 帮助 查询",
+            f"11) 本大局牌池在开局时一次锁定，后续小局不变化。\n{pool_text}",
         ]
 
         try:
@@ -1347,7 +1502,7 @@ class LiarsBarBasicPlugin(Star):
                 [
                     Comp.At(qq=target_uid),
                     Comp.Plain(
-                        " 出牌超时 90 秒，直接整局淘汰。\n"
+                        f" 出牌超时 {self._play_timeout_seconds()} 秒，直接整局淘汰。\n"
                         + self._guide("", "本小局结束，系统将自动开始下一小局。")
                     ),
                 ],
@@ -1608,6 +1763,8 @@ class LiarsBarBasicPlugin(Star):
     def _help_text(self) -> str:
         return (
             "【骗子酒馆基础版 帮助】\n"
+            "发牌：每小局会清空上局手牌，并给当前存活玩家每人固定发 5 张；牌型=太阳/月亮/星星/魔术。\n"
+            "卡池：在开局时按人数一次锁定（3人=15张、4人=20张、5人=25张），本大局后续小局不再变化。\n\n"
             "群指令：\n"
             "- /酒馆 开房：创建房间，发起者自动房主\n"
             "- /酒馆 加入：加入本群房间（3~5人可开）\n"
@@ -1620,12 +1777,16 @@ class LiarsBarBasicPlugin(Star):
             "私聊指令：\n"
             "- /酒馆 手牌：查看手牌图和序号\n"
             "- /酒馆 出 2 4 5：一次出多张暗牌\n\n"
+            "超时机制：\n"
+            f"- 出牌超时：{self._play_timeout_seconds()} 秒（超时整局淘汰）\n"
+            f"- 剪线超时：{self._wire_timeout_seconds()} 秒（超时自动剪线）\n\n"
             "常用流程：\n"
             "开房 -> 加入 -> 开始 -> 私聊出牌 -> 群里质疑/剪线\n\n"
             "常见问题：\n"
             "1) 私聊不可达：请先加好友并私聊机器人一次\n"
             "2) 一人一房：同一时间只能在一个群房间中\n"
-            "3) 非当前回合：请先 /酒馆 状态 查看行动人\n\n"
+            "3) 非当前回合：请先 /酒馆 状态 查看行动人\n"
+            "4) 私聊不能开房/加入：这类命令只能在群聊使用\n\n"
             "下一步：在群里发送 /酒馆 开房 开始游戏。"
         )
 
@@ -1637,7 +1798,8 @@ class LiarsBarBasicPlugin(Star):
             "说明：\n"
             "1) 只有轮到你时才能出牌\n"
             "2) 可一次出多张，序号不可重复\n"
-            "3) 出牌后去群里看质疑/结算\n\n"
+            "3) 出牌后去群里看质疑/结算\n"
+            "4) 开房/加入/开始/质疑/剪线/结束必须在群里执行\n\n"
             "下一步：先发送 /酒馆 手牌 查看当前序号。"
         )
 
@@ -1702,6 +1864,18 @@ class LiarsBarBasicPlugin(Star):
 
         if room.last_play and room.last_play.player_id not in room.players:
             room.last_play = None
+
+        if room.fixed_hand_size <= 0:
+            room.fixed_hand_size = FIXED_HAND_SIZE
+
+        if room.initial_player_count <= 0 and room.order:
+            room.initial_player_count = len(room.order)
+
+        need_rebuild = room.round_deck_total <= 0 or not room.round_deck_counts
+        if need_rebuild and room.phase != PHASE_WAITING:
+            base_players = room.initial_player_count if room.initial_player_count > 0 else max(3, min(5, len(room.order)))
+            room.round_deck_counts = self._build_locked_deck_counts(base_players)
+            room.round_deck_total = sum(room.round_deck_counts.values())
 
     async def _save_state_locked(self) -> None:
         payload = {
