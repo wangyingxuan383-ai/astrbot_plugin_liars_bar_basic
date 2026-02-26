@@ -563,7 +563,7 @@ class AssetRenderer:
         return max(0, int(bbox[2] - bbox[0]))
 
 
-@register(PLUGIN_NAME, "codex", "骗子酒馆基础版（本地素材）", "0.1.0", "local")
+@register(PLUGIN_NAME, "金幺", "骗子酒馆基础版（本地素材）", "0.1.0", "local")
 class LiarsBarBasicPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
