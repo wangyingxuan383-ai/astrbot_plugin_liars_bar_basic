@@ -66,6 +66,11 @@ AstrBot QQ 群聊《骗子酒馆基础版》插件（3~5 人）。
 - `state.json`：房间状态
 - `cache/`：临时渲染图缓存
 
+## 并发与锁策略
+- 全局状态锁 `state_lock` 仅用于状态读写与计时器令牌更新，不在锁内做消息网络发送。
+- 采用“两阶段处理”：锁内完成状态变更并生成待发送队列；释放锁后统一发送群/私聊消息。
+- 开局私聊连通性检查使用并发探测（`asyncio.gather` + 超时），避免串行阻塞全局状态锁。
+
 ## 字体策略（兼容无本地字体环境）
 - 优先级 1：若安装了 `astrbot_plugin_sudoku`，优先复用：
 - `astrbot_plugin_sudoku/assets/LXGWWenKai-Regular.ttf`

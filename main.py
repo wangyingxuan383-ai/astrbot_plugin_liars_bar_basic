@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import contextlib
 import json
 import os
@@ -247,6 +248,32 @@ class RoomState:
         if isinstance(last_play_raw, dict):
             room.last_play = LastPlay.from_dict(last_play_raw)
         return room
+
+
+@dataclass
+class RoundUpdate:
+    outbox: list[tuple[str, list[Any]]] = field(default_factory=list)
+    hand_push: list[str] = field(default_factory=list)
+
+
+class StateRepository:
+    def __init__(self, state_path: Path):
+        self.state_path = state_path
+
+    def load(self) -> Optional[dict[str, Any]]:
+        if not self.state_path.exists():
+            return None
+        try:
+            with self.state_path.open("r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    def save(self, payload: dict[str, Any]) -> None:
+        tmp = self.state_path.with_suffix(".tmp")
+        with tmp.open("w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, self.state_path)
 
 
 class AssetRenderer:
@@ -586,6 +613,7 @@ class LiarsBarBasicPlugin(Star):
         self.cache_dir = self.data_dir / "cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.data_dir / "state.json"
+        self.state_repo = StateRepository(self.state_path)
 
         self.renderer = AssetRenderer(self.assets_dir, self.cache_dir)
 
@@ -785,6 +813,7 @@ class LiarsBarBasicPlugin(Star):
         platform_id = self._platform_id_from_umo(room_id)
         bot_id = str(getattr(event, "get_self_id", lambda: "")( ))
 
+        msg = ""
         async with self.state_lock:
             conflict_room = self.player_room_index.get(user_id)
             if conflict_room and conflict_room != room_id:
@@ -792,41 +821,36 @@ class LiarsBarBasicPlugin(Star):
                     f"你已在其他房间中（群 {self._room_group_hint(conflict_room)}），不能重复开房。",
                     "先在原房间用 /酒馆 结束，或等待房间结束后再加入新房。",
                 )
-                await event.send(event.plain_result(msg))
-                return
-
-            if room_id in self.rooms:
+            elif room_id in self.rooms:
                 room = self.rooms[room_id]
                 msg = self._guide(
                     f"本群已经存在酒馆房间，当前人数 {len(room.order)}。",
                     "其他玩家请用 /酒馆 加入，房主人数够后用 /酒馆 开始。",
                 )
-                await event.send(event.plain_result(msg))
-                return
+            else:
+                now = time.time()
+                room = RoomState(
+                    room_id=room_id,
+                    group_umo=room_id,
+                    group_id=group_id,
+                    platform_id=platform_id,
+                    bot_id=bot_id,
+                    owner_id=user_id,
+                    owner_name=user_name,
+                    created_at=now,
+                    updated_at=now,
+                )
+                room.players[user_id] = PlayerState(user_id=user_id, name=user_name)
+                room.order.append(user_id)
 
-            now = time.time()
-            room = RoomState(
-                room_id=room_id,
-                group_umo=room_id,
-                group_id=group_id,
-                platform_id=platform_id,
-                bot_id=bot_id,
-                owner_id=user_id,
-                owner_name=user_name,
-                created_at=now,
-                updated_at=now,
-            )
-            room.players[user_id] = PlayerState(user_id=user_id, name=user_name)
-            room.order.append(user_id)
+                self.rooms[room_id] = room
+                self.player_room_index[user_id] = room_id
+                await self._save_state_locked()
+                msg = self._guide(
+                    f"开房成功。你是房主，当前 1/5 人。\n{self._room_create_card_intro()}",
+                    "让其他人发送 /酒馆 加入；人数达到 3~5 人后你发送 /酒馆 开始。",
+                )
 
-            self.rooms[room_id] = room
-            self.player_room_index[user_id] = room_id
-            await self._save_state_locked()
-
-        msg = self._guide(
-            f"开房成功。你是房主，当前 1/5 人。\n{self._room_create_card_intro()}",
-            "让其他人发送 /酒馆 加入；人数达到 3~5 人后你发送 /酒馆 开始。",
-        )
         await event.send(event.plain_result(msg))
 
     async def _cmd_join_room(self, event: AstrMessageEvent) -> None:
@@ -834,197 +858,219 @@ class LiarsBarBasicPlugin(Star):
         user_name = event.get_sender_name()
         room_id = event.unified_msg_origin
 
+        msg = ""
         async with self.state_lock:
             room = self.rooms.get(room_id)
             if not room:
                 msg = self._guide("本群当前没有房间。", "先由一名玩家发送 /酒馆 开房。")
-                await event.send(event.plain_result(msg))
-                return
-
-            conflict_room = self.player_room_index.get(user_id)
-            if conflict_room and conflict_room != room_id:
+            elif (conflict_room := self.player_room_index.get(user_id)) and conflict_room != room_id:
                 msg = self._guide(
                     f"你已在其他房间中（群 {self._room_group_hint(conflict_room)}）。",
                     "请先结束原房间后再加入。",
                 )
-                await event.send(event.plain_result(msg))
-                return
-
-            if room.phase != PHASE_WAITING:
+            elif room.phase != PHASE_WAITING:
                 msg = self._guide("当前房间已开始，不能中途加入。", "等待本局结束后再开新房。")
-                await event.send(event.plain_result(msg))
-                return
-
-            if user_id in room.players:
+            elif user_id in room.players:
                 msg = self._guide("你已经在房间中了。", "房主可在人数达标后发送 /酒馆 开始。")
-                await event.send(event.plain_result(msg))
-                return
-
-            if len(room.order) >= 5:
+            elif len(room.order) >= 5:
                 msg = self._guide("房间人数已满（5人）。", "可等待下一局或由房主 /酒馆 结束 后重开。")
-                await event.send(event.plain_result(msg))
-                return
+            else:
+                room.players[user_id] = PlayerState(user_id=user_id, name=user_name)
+                room.order.append(user_id)
+                room.updated_at = time.time()
+                self.player_room_index[user_id] = room_id
+                await self._save_state_locked()
 
-            room.players[user_id] = PlayerState(user_id=user_id, name=user_name)
-            room.order.append(user_id)
-            room.updated_at = time.time()
-            self.player_room_index[user_id] = room_id
-            await self._save_state_locked()
-
-            count = len(room.order)
-            owner_name = room.players.get(room.owner_id).name if room.owner_id in room.players else room.owner_name
-
-        msg = self._guide(
-            f"加入成功，当前 {count}/5 人。房主：{owner_name}",
-            "人数达到 3~5 后，房主发送 /酒馆 开始。",
-        )
+                count = len(room.order)
+                owner_name = room.players.get(room.owner_id).name if room.owner_id in room.players else room.owner_name
+                msg = self._guide(
+                    f"加入成功，当前 {count}/5 人。房主：{owner_name}",
+                    "人数达到 3~5 后，房主发送 /酒馆 开始。",
+                )
         await event.send(event.plain_result(msg))
 
     async def _cmd_start_room(self, event: AstrMessageEvent) -> None:
         room_id = event.unified_msg_origin
         user_id = str(event.get_sender_id())
+        err_msg = ""
+        need_check = False
+        probe_targets: list[str] = []
+        probe_platform_id = ""
 
         async with self.state_lock:
             room = self.rooms.get(room_id)
             if not room:
-                msg = self._guide("本群还没有房间。", "先发送 /酒馆 开房。")
-                await event.send(event.plain_result(msg))
-                return
+                err_msg = self._guide("本群还没有房间。", "先发送 /酒馆 开房。")
+            elif room.phase != PHASE_WAITING:
+                err_msg = self._guide("房间已在进行中。", "可用 /酒馆 状态 查看当前进度。")
+            elif user_id != room.owner_id:
+                err_msg = self._guide("只有房主可以开始。", "请房主发送 /酒馆 开始。")
+            elif len(room.order) < 3:
+                err_msg = self._guide("人数不足，至少需要 3 人。", "让更多玩家发送 /酒馆 加入。")
+            elif len(room.order) > 5:
+                err_msg = self._guide("人数超过上限 5 人。", "请房主 /酒馆 结束 后重新开房。")
+            else:
+                need_check = bool(self.conf.get("require_dm_reachable_before_start", True))
+                if need_check:
+                    probe_targets = list(room.order)
+                    probe_platform_id = room.platform_id
 
-            if room.phase != PHASE_WAITING:
-                msg = self._guide("房间已在进行中。", "可用 /酒馆 状态 查看当前进度。")
-                await event.send(event.plain_result(msg))
-                return
+        if err_msg:
+            await event.send(event.plain_result(err_msg))
+            return
 
-            if user_id != room.owner_id:
-                msg = self._guide("只有房主可以开始。", "请房主发送 /酒馆 开始。")
-                await event.send(event.plain_result(msg))
-                return
+        probe_results: dict[str, bool] = {}
+        if need_check and probe_targets:
+            async def run_probe(uid: str) -> tuple[str, bool]:
+                try:
+                    ok = await asyncio.wait_for(self._probe_private_reachable(probe_platform_id, uid), timeout=8.0)
+                except Exception:
+                    ok = False
+                return uid, ok
 
-            if len(room.order) < 3:
-                msg = self._guide("人数不足，至少需要 3 人。", "让更多玩家发送 /酒馆 加入。")
-                await event.send(event.plain_result(msg))
-                return
+            pairs = await asyncio.gather(*(run_probe(uid) for uid in probe_targets))
+            probe_results = dict(pairs)
 
-            if len(room.order) > 5:
-                msg = self._guide("人数超过上限 5 人。", "请房主 /酒馆 结束 后重新开房。")
-                await event.send(event.plain_result(msg))
-                return
+        outbox: list[tuple[str, list[Any]]] = []
+        update = RoundUpdate()
+        room_snapshot: Optional[RoomState] = None
+        send_rules = False
 
-            need_check = bool(self.conf.get("require_dm_reachable_before_start", True))
-            failed: list[str] = []
-            if need_check:
-                for uid in room.order:
-                    ok = await self._probe_private_reachable(room, uid)
-                    room.players[uid].dm_reachable = ok
-                    if not ok:
-                        failed.append(uid)
+        async with self.state_lock:
+            room = self.rooms.get(room_id)
+            if not room:
+                err_msg = self._guide("房间不存在或已结束。", "请重新 /酒馆 开房。")
+            elif room.phase != PHASE_WAITING:
+                err_msg = self._guide("房间状态已变化，无法开始。", "请用 /酒馆 状态 查看后重试。")
+            elif user_id != room.owner_id:
+                err_msg = self._guide("只有房主可以开始。", "请房主发送 /酒馆 开始。")
+            elif len(room.order) < 3 or len(room.order) > 5:
+                err_msg = self._guide("人数不在 3~5 范围。", "请调整人数后重试 /酒馆 开始。")
+            else:
+                failed: list[str] = []
+                if need_check:
+                    for uid in room.order:
+                        ok = bool(probe_results.get(uid, False))
+                        room.players[uid].dm_reachable = ok
+                        if not ok:
+                            failed.append(uid)
 
-            if failed:
-                chain: list[Any] = [Comp.Plain("以下玩家私聊不可达，请先加好友并私聊机器人后重试：")]
-                for uid in failed:
-                    chain.append(Comp.Plain(" "))
-                    chain.append(Comp.At(qq=uid))
-                chain.append(Comp.Plain("\n下一步：处理后由房主再次发送 /酒馆 开始。"))
-                await self._send_to_umo(room.group_umo, chain)
-                room.updated_at = time.time()
-                await self._save_state_locked()
-                return
+                if failed:
+                    chain: list[Any] = [Comp.Plain("以下玩家私聊不可达，请先加好友并私聊机器人后重试：")]
+                    for uid in failed:
+                        chain.append(Comp.Plain(" "))
+                        chain.append(Comp.At(qq=uid))
+                    chain.append(Comp.Plain("\n下一步：处理后由房主再次发送 /酒馆 开始。"))
+                    outbox.append((room.group_umo, chain))
+                    room.updated_at = time.time()
+                    await self._save_state_locked()
+                else:
+                    room.phase = PHASE_PLAYING
+                    room.started_at = time.time()
+                    room.round_no = 0
+                    room.dealer_cursor = random.randint(0, max(0, len(room.order) - 1))
+                    room.last_play = None
+                    room.pending_wire_user_id = ""
+                    room.wire_options = []
+                    room.wire_index_map = {}
+                    room.initial_player_count = len(room.order)
+                    room.fixed_hand_size = FIXED_HAND_SIZE
+                    room.round_deck_counts = self._build_locked_deck_counts(room.initial_player_count)
+                    room.round_deck_total = sum(room.round_deck_counts.values())
+                    room.play_deadline_ts = 0
+                    room.wire_deadline_ts = 0
 
-            room.phase = PHASE_PLAYING
-            room.started_at = time.time()
-            room.round_no = 0
-            room.dealer_cursor = random.randint(0, max(0, len(room.order) - 1))
-            room.last_play = None
-            room.pending_wire_user_id = ""
-            room.wire_options = []
-            room.wire_index_map = {}
-            room.initial_player_count = len(room.order)
-            room.fixed_hand_size = FIXED_HAND_SIZE
-            room.round_deck_counts = self._build_locked_deck_counts(room.initial_player_count)
-            room.round_deck_total = sum(room.round_deck_counts.values())
-            room.play_deadline_ts = 0
-            room.wire_deadline_ts = 0
+                    for uid in room.order:
+                        room.players[uid].reset_for_new_game()
 
-            for uid in room.order:
-                room.players[uid].reset_for_new_game()
+                    update = self._start_new_round_locked(room, reason="大局开始")
+                    room.updated_at = time.time()
+                    await self._save_state_locked()
+                    if room.room_id in self.rooms:
+                        room_snapshot = copy.deepcopy(room)
+                        send_rules = True
 
-            await self._send_rules_forward(room)
-            await self._start_new_round_locked(room, reason="大局开始")
-            room.updated_at = time.time()
-            await self._save_state_locked()
+        if err_msg:
+            await event.send(event.plain_result(err_msg))
+            return
+
+        if outbox:
+            await self._flush_outbox(outbox)
+            return
+
+        if send_rules and room_snapshot:
+            await self._send_rules_forward(room_snapshot)
+        await self._dispatch_round_update(room_snapshot, update)
 
     async def _cmd_status(self, event: AstrMessageEvent) -> None:
         room_id = event.unified_msg_origin
+        msg = ""
         async with self.state_lock:
             room = self.rooms.get(room_id)
             if not room:
                 msg = self._guide("本群没有进行中的酒馆房间。", "先发送 /酒馆 开房。")
-                await event.send(event.plain_result(msg))
-                return
+            else:
+                alive = room.alive_ids()
+                lines = [
+                    f"房间状态：{self._phase_label(room.phase)}",
+                    f"房主：{room.players.get(room.owner_id).name if room.owner_id in room.players else room.owner_name}",
+                    f"玩家数：{len(room.order)}（存活 {len(alive)}）",
+                    f"小局：第 {room.round_no} 局",
+                ]
 
-            alive = room.alive_ids()
-            lines = [
-                f"房间状态：{self._phase_label(room.phase)}",
-                f"房主：{room.players.get(room.owner_id).name if room.owner_id in room.players else room.owner_name}",
-                f"玩家数：{len(room.order)}（存活 {len(alive)}）",
-                f"小局：第 {room.round_no} 局",
-            ]
+                if room.phase in {PHASE_PLAYING, PHASE_AWAIT_WIRE} and room.target_card:
+                    lines.append(f"当前目标牌：{CARD_NAME.get(room.target_card, room.target_card)}")
 
-            if room.phase in {PHASE_PLAYING, PHASE_AWAIT_WIRE} and room.target_card:
-                lines.append(f"当前目标牌：{CARD_NAME.get(room.target_card, room.target_card)}")
+                if room.phase == PHASE_PLAYING and room.current_turn_user_id:
+                    pname = room.players.get(room.current_turn_user_id).name if room.current_turn_user_id in room.players else room.current_turn_user_id
+                    lines.append(f"当前行动：{pname}（私聊 /酒馆 出 序号...）")
 
-            if room.phase == PHASE_PLAYING and room.current_turn_user_id:
-                pname = room.players.get(room.current_turn_user_id).name if room.current_turn_user_id in room.players else room.current_turn_user_id
-                lines.append(f"当前行动：{pname}（私聊 /酒馆 出 序号...）")
+                if room.phase == PHASE_AWAIT_WIRE and room.pending_wire_user_id:
+                    pname = room.players.get(room.pending_wire_user_id).name if room.pending_wire_user_id in room.players else room.pending_wire_user_id
+                    opts = ", ".join([f"{idx}={color}" for idx, color in room.wire_index_map.items()])
+                    lines.append(f"待剪线：{pname}（{opts}）")
 
-            if room.phase == PHASE_AWAIT_WIRE and room.pending_wire_user_id:
-                pname = room.players.get(room.pending_wire_user_id).name if room.pending_wire_user_id in room.players else room.pending_wire_user_id
-                opts = ", ".join([f"{idx}={color}" for idx, color in room.wire_index_map.items()])
-                lines.append(f"待剪线：{pname}（{opts}）")
+                lines.append("玩家信息：")
+                for uid in room.order:
+                    p = room.players.get(uid)
+                    if not p:
+                        continue
+                    status = "存活" if p.alive else "出局"
+                    lines.append(f"- {p.name}：{status}，手牌 {len(p.hand)}")
 
-            lines.append("玩家信息：")
-            for uid in room.order:
-                p = room.players.get(uid)
-                if not p:
-                    continue
-                status = "存活" if p.alive else "出局"
-                lines.append(f"- {p.name}：{status}，手牌 {len(p.hand)}")
-
-            guide = "可用 /酒馆 质疑、/酒馆 剪线、/酒馆 结束 或 /酒馆 帮助。"
-            msg = self._guide("\n".join(lines), guide)
-            await event.send(event.plain_result(msg))
+                guide = "可用 /酒馆 质疑、/酒馆 剪线、/酒馆 结束 或 /酒馆 帮助。"
+                msg = self._guide("\n".join(lines), guide)
+        await event.send(event.plain_result(msg))
 
     async def _cmd_challenge(self, event: AstrMessageEvent) -> None:
         room_id = event.unified_msg_origin
         challenger_id = str(event.get_sender_id())
+        msg = ""
+        update = RoundUpdate()
+        room_snapshot: Optional[RoomState] = None
 
         async with self.state_lock:
             room = self.rooms.get(room_id)
             if not room:
                 msg = self._guide("本群没有房间。", "先发送 /酒馆 开房。")
-                await event.send(event.plain_result(msg))
-                return
-
-            if room.phase != PHASE_PLAYING:
+            elif room.phase != PHASE_PLAYING:
                 msg = self._guide("当前不是质疑阶段。", "可用 /酒馆 状态 查看当前需要的动作。")
-                await event.send(event.plain_result(msg))
-                return
-
-            if not room.last_play:
+            elif not room.last_play:
                 msg = self._guide("还没有可质疑的上一手出牌。", "等待当前行动玩家先私聊出牌。")
-                await event.send(event.plain_result(msg))
-                return
-
-            if challenger_id != room.current_turn_user_id:
+            elif challenger_id != room.current_turn_user_id:
                 current_name = room.players.get(room.current_turn_user_id).name if room.current_turn_user_id in room.players else room.current_turn_user_id
                 msg = self._guide(f"现在应由 {current_name} 决定是否质疑。", "请等待轮到你。")
-                await event.send(event.plain_result(msg))
-                return
+            else:
+                update = self._resolve_challenge_locked(room, challenger_id, auto=False)
+                room.updated_at = time.time()
+                await self._save_state_locked()
+                if room.room_id in self.rooms:
+                    room_snapshot = copy.deepcopy(room)
 
-            await self._resolve_challenge_locked(room, challenger_id, auto=False)
-            room.updated_at = time.time()
-            await self._save_state_locked()
+        if msg:
+            await event.send(event.plain_result(msg))
+            return
+        await self._dispatch_round_update(room_snapshot, update)
 
     async def _cmd_cut_wire(self, event: AstrMessageEvent, args: list[str]) -> None:
         room_id = event.unified_msg_origin
@@ -1035,193 +1081,201 @@ class LiarsBarBasicPlugin(Star):
             await event.send(event.plain_result(msg))
             return
 
+        msg = ""
+        update = RoundUpdate()
+        room_snapshot: Optional[RoomState] = None
         async with self.state_lock:
             room = self.rooms.get(room_id)
             if not room:
                 msg = self._guide("本群没有房间。", "先发送 /酒馆 开房。")
-                await event.send(event.plain_result(msg))
-                return
-
-            if room.phase != PHASE_AWAIT_WIRE:
+            elif room.phase != PHASE_AWAIT_WIRE:
                 msg = self._guide("当前不是剪线阶段。", "可用 /酒馆 状态 查看当前阶段。")
-                await event.send(event.plain_result(msg))
-                return
-
-            if user_id != room.pending_wire_user_id:
+            elif user_id != room.pending_wire_user_id:
                 pname = room.players.get(room.pending_wire_user_id).name if room.pending_wire_user_id in room.players else room.pending_wire_user_id
                 msg = self._guide(f"当前应由 {pname} 剪线。", "请等待该玩家操作。")
-                await event.send(event.plain_result(msg))
-                return
+            else:
+                picked = self._resolve_wire_arg(args[0], room)
+                if not picked:
+                    opts = " / ".join([f"{k}={v}" for k, v in room.wire_index_map.items()])
+                    msg = self._guide(f"线名无效。当前可选：{opts}", "请重新发送 /酒馆 剪线 红|蓝|黄。")
+                else:
+                    update = self._apply_wire_cut_locked(room, user_id, picked, by_timeout=False)
+                    room.updated_at = time.time()
+                    await self._save_state_locked()
+                    if room.room_id in self.rooms:
+                        room_snapshot = copy.deepcopy(room)
 
-            picked = self._resolve_wire_arg(args[0], room)
-            if not picked:
-                opts = " / ".join([f"{k}={v}" for k, v in room.wire_index_map.items()])
-                msg = self._guide(f"线名无效。当前可选：{opts}", "请重新发送 /酒馆 剪线 红|蓝|黄。")
-                await event.send(event.plain_result(msg))
-                return
-
-            await self._apply_wire_cut_locked(room, user_id, picked, by_timeout=False)
-            room.updated_at = time.time()
-            await self._save_state_locked()
+        if msg:
+            await event.send(event.plain_result(msg))
+            return
+        await self._dispatch_round_update(room_snapshot, update)
 
     async def _cmd_end_room(self, event: AstrMessageEvent) -> None:
         room_id = event.unified_msg_origin
         user_id = str(event.get_sender_id())
         is_admin = bool(getattr(event, "is_admin", lambda: False)())
+        msg = ""
+        outbox: list[tuple[str, list[Any]]] = []
 
         async with self.state_lock:
             room = self.rooms.get(room_id)
             if not room:
                 msg = self._guide("本群没有房间可结束。", "如需新开一局，请发送 /酒馆 开房。")
-                await event.send(event.plain_result(msg))
-                return
-
-            if user_id != room.owner_id and not is_admin:
+            elif user_id != room.owner_id and not is_admin:
                 msg = self._guide("仅房主或管理员可以结束房间。", "请让房主发送 /酒馆 结束。")
-                await event.send(event.plain_result(msg))
-                return
+            else:
+                ender = room.players.get(user_id).name if user_id in room.players else event.get_sender_name()
+                outbox.append(
+                    (
+                        room.group_umo,
+                        [
+                            Comp.Plain(
+                                self._guide(
+                                    f"房间已结束（操作人：{ender}）。",
+                                    "如需再玩，请发送 /酒馆 开房。",
+                                )
+                            )
+                        ],
+                    )
+                )
+                self._drop_room_locked(room.room_id)
+                await self._save_state_locked()
 
-            ender = room.players.get(user_id).name if user_id in room.players else event.get_sender_name()
-            await self._send_group_text(
-                room,
-                self._guide(
-                    f"房间已结束（操作人：{ender}）。",
-                    "如需再玩，请发送 /酒馆 开房。",
-                ),
-            )
-            self._drop_room_locked(room.room_id)
-            await self._save_state_locked()
+        if msg:
+            await event.send(event.plain_result(msg))
+            return
+        await self._flush_outbox(outbox)
 
     async def _cmd_private_hand(self, event: AstrMessageEvent) -> None:
         user_id = str(event.get_sender_id())
+        msg = ""
+        room_snapshot: Optional[RoomState] = None
         async with self.state_lock:
             room_id = self.player_room_index.get(user_id)
             if not room_id or room_id not in self.rooms:
                 msg = self._guide("你当前不在任何酒馆房间。", "先去群里发送 /酒馆 开房 或 /酒馆 加入。")
-                await event.send(event.plain_result(msg))
-                return
+            else:
+                room = self.rooms[room_id]
+                if user_id not in room.players:
+                    msg = self._guide("房间状态异常，未找到你的玩家信息。", "请通知房主 /酒馆 结束 后重开。")
+                else:
+                    room_snapshot = copy.deepcopy(room)
 
-            room = self.rooms[room_id]
-            if user_id not in room.players:
-                msg = self._guide("房间状态异常，未找到你的玩家信息。", "请通知房主 /酒馆 结束 后重开。")
-                await event.send(event.plain_result(msg))
-                return
+        if msg:
+            await event.send(event.plain_result(msg))
+            return
 
-            try:
-                await self._send_private_hand(room, user_id, force_tip=True)
-            except Exception:
-                msg = self._guide("私聊消息发送失败。", "请先加好友并私聊机器人一次后重试。")
-                await event.send(event.plain_result(msg))
+        try:
+            if room_snapshot:
+                await self._send_private_hand(room_snapshot, user_id, force_tip=True)
+        except Exception:
+            msg = self._guide("私聊消息发送失败。", "请先加好友并私聊机器人一次后重试。")
+            await event.send(event.plain_result(msg))
 
     async def _cmd_private_play(self, event: AstrMessageEvent, args: list[str]) -> None:
         user_id = str(event.get_sender_id())
+        msg = ""
+        done_msg = ""
+        update = RoundUpdate()
+        room_snapshot: Optional[RoomState] = None
 
         async with self.state_lock:
             room_id = self.player_room_index.get(user_id)
             if not room_id or room_id not in self.rooms:
                 msg = self._guide("你当前不在任何酒馆房间。", "先去群里 /酒馆 开房 或 /酒馆 加入。")
-                await event.send(event.plain_result(msg))
-                return
+            else:
+                room = self.rooms[room_id]
+                if room.phase != PHASE_PLAYING:
+                    msg = self._guide("当前不是出牌阶段。", "可在群里用 /酒馆 状态 查看当前需要动作。")
+                else:
+                    player = room.players.get(user_id)
+                    if not player:
+                        msg = self._guide("玩家信息缺失。", "请通知房主 /酒馆 结束 后重开。")
+                    elif not player.alive:
+                        msg = self._guide("你已出局，不能继续出牌。", "等待本局结束后再开新房。")
+                    elif user_id != room.current_turn_user_id:
+                        name = room.players.get(room.current_turn_user_id).name if room.current_turn_user_id in room.players else room.current_turn_user_id
+                        msg = self._guide(f"现在轮到 {name}。", "请等待轮到你后再私聊 /酒馆 出。")
+                    elif not args:
+                        msg = self._guide("用法：/酒馆 出 2 4 5", "先发送 /酒馆 手牌 查看序号。")
+                    else:
+                        parsed = self._parse_indices(args, len(player.hand))
+                        if isinstance(parsed, str):
+                            msg = self._guide(parsed, "先发送 /酒馆 手牌 查看正确序号后再提交。")
+                        else:
+                            indices = parsed
+                            played_cards = [player.hand[i - 1] for i in indices]
+                            for idx in sorted(indices, reverse=True):
+                                player.hand.pop(idx - 1)
 
-            room = self.rooms[room_id]
-            if room.phase != PHASE_PLAYING:
-                msg = self._guide("当前不是出牌阶段。", "可在群里用 /酒馆 状态 查看当前需要动作。")
-                await event.send(event.plain_result(msg))
-                return
+                            room.last_play = LastPlay(
+                                player_id=user_id,
+                                cards=played_cards,
+                                declared_target=room.target_card,
+                                played_at=time.time(),
+                            )
 
-            player = room.players.get(user_id)
-            if not player:
-                msg = self._guide("玩家信息缺失。", "请通知房主 /酒馆 结束 后重开。")
-                await event.send(event.plain_result(msg))
-                return
+                            next_uid = self._next_alive_after(room, user_id)
+                            if not next_uid:
+                                update = self._announce_winner_and_close_locked(room, reason="其他玩家已全部出局")
+                            else:
+                                declared = CARD_NAME.get(room.target_card, room.target_card)
+                                card_count = len(played_cards)
+                                pname = player.name
+                                next_name = room.players[next_uid].name if next_uid in room.players else next_uid
+                                update.outbox.append(
+                                    (
+                                        room.group_umo,
+                                        [
+                                            Comp.Plain(
+                                                self._guide(
+                                                    f"{pname} 已暗出 {card_count} 张，并宣称【{declared}】。",
+                                                    f"现在由 {next_name} 决定：群里 /酒馆 质疑，或在私聊直接出牌。",
+                                                )
+                                            )
+                                        ],
+                                    )
+                                )
 
-            if not player.alive:
-                msg = self._guide("你已出局，不能继续出牌。", "等待本局结束后再开新房。")
-                await event.send(event.plain_result(msg))
-                return
+                                if len(player.hand) == 0:
+                                    room.current_turn_user_id = next_uid
+                                    update.outbox.append((room.group_umo, [Comp.Plain(f"{pname} 已出完手牌，系统自动触发下家质疑。")]))
+                                    challenge_update = self._resolve_challenge_locked(room, next_uid, auto=True)
+                                    update.outbox.extend(challenge_update.outbox)
+                                    update.hand_push.extend(challenge_update.hand_push)
+                                else:
+                                    room.current_turn_user_id = next_uid
+                                    room.phase = PHASE_PLAYING
+                                    room.pending_wire_user_id = ""
+                                    room.wire_options = []
+                                    room.wire_index_map = {}
+                                    room.wire_deadline_ts = 0
+                                    room.action_token += 1
+                                    room.play_deadline_ts = time.time() + self._play_timeout_seconds()
+                                    self._arm_play_timeout_task(room.room_id, room.action_token, room.current_turn_user_id, room.play_deadline_ts)
+                                    update.hand_push.append(user_id)
+                                    done_msg = self._guide(
+                                        f"已提交：你本次暗出 {card_count} 张。",
+                                        "等待群内结算，或稍后再用 /酒馆 手牌 查看最新手牌。",
+                                    )
 
-            if user_id != room.current_turn_user_id:
-                name = room.players.get(room.current_turn_user_id).name if room.current_turn_user_id in room.players else room.current_turn_user_id
-                msg = self._guide(f"现在轮到 {name}。", "请等待轮到你后再私聊 /酒馆 出。")
-                await event.send(event.plain_result(msg))
-                return
+                            room.updated_at = time.time()
+                            await self._save_state_locked()
+                            if room.room_id in self.rooms:
+                                room_snapshot = copy.deepcopy(room)
 
-            if not args:
-                msg = self._guide("用法：/酒馆 出 2 4 5", "先发送 /酒馆 手牌 查看序号。")
-                await event.send(event.plain_result(msg))
-                return
+        if msg:
+            await event.send(event.plain_result(msg))
+            return
 
-            parsed = self._parse_indices(args, len(player.hand))
-            if isinstance(parsed, str):
-                msg = self._guide(parsed, "先发送 /酒馆 手牌 查看正确序号后再提交。")
-                await event.send(event.plain_result(msg))
-                return
-
-            indices = parsed
-            played_cards = [player.hand[i - 1] for i in indices]
-            for idx in sorted(indices, reverse=True):
-                player.hand.pop(idx - 1)
-
-            room.last_play = LastPlay(
-                player_id=user_id,
-                cards=played_cards,
-                declared_target=room.target_card,
-                played_at=time.time(),
-            )
-
-            next_uid = self._next_alive_after(room, user_id)
-            if not next_uid:
-                await self._announce_winner_and_close_locked(room, reason="其他玩家已全部出局")
-                await self._save_state_locked()
-                return
-
-            declared = CARD_NAME.get(room.target_card, room.target_card)
-            card_count = len(played_cards)
-            pname = player.name
-            next_name = room.players[next_uid].name if next_uid in room.players else next_uid
-
-            await self._send_group_text(
-                room,
-                self._guide(
-                    f"{pname} 已暗出 {card_count} 张，并宣称【{declared}】。",
-                    f"现在由 {next_name} 决定：群里 /酒馆 质疑，或在私聊直接出牌。",
-                ),
-            )
-
-            if len(player.hand) == 0:
-                room.current_turn_user_id = next_uid
-                await self._send_group_text(
-                    room,
-                    f"{pname} 已出完手牌，系统自动触发下家质疑。",
-                )
-                await self._resolve_challenge_locked(room, next_uid, auto=True)
-                room.updated_at = time.time()
-                await self._save_state_locked()
-                return
-
-            room.current_turn_user_id = next_uid
-            room.phase = PHASE_PLAYING
-            room.pending_wire_user_id = ""
-            room.wire_options = []
-            room.wire_index_map = {}
-            room.wire_deadline_ts = 0
-            room.action_token += 1
-            room.play_deadline_ts = time.time() + self._play_timeout_seconds()
-            self._arm_play_timeout_task(room.room_id, room.action_token, room.current_turn_user_id, room.play_deadline_ts)
-
-            await self._send_private_hand(room, user_id, force_tip=True)
-            room.updated_at = time.time()
-            await self._save_state_locked()
-
-            done_msg = self._guide(
-                f"已提交：你本次暗出 {card_count} 张。",
-                "等待群内结算，或稍后再用 /酒馆 手牌 查看最新手牌。",
-            )
+        await self._dispatch_round_update(room_snapshot, update)
+        if done_msg:
             await event.send(event.plain_result(done_msg))
 
-    async def _resolve_challenge_locked(self, room: RoomState, challenger_id: str, auto: bool) -> None:
+    def _resolve_challenge_locked(self, room: RoomState, challenger_id: str, auto: bool) -> RoundUpdate:
+        update = RoundUpdate()
         if not room.last_play:
-            return
+            return update
 
         last = room.last_play
         liar = any(card not in {room.target_card, CARD_MAGIC} for card in last.cards)
@@ -1237,16 +1291,20 @@ class LiarsBarBasicPlugin(Star):
             result = f"质疑失败：{revealer} 本次暗牌全为目标牌/魔术牌。"
 
         auto_prefix = "[系统自动质疑] " if auto else ""
-        await self._send_group_text(
-            room,
-            f"{auto_prefix}翻牌结果：{revealed_cards}\n发起方：{challenger}\n{result}",
+        update.outbox.append(
+            (
+                room.group_umo,
+                [Comp.Plain(f"{auto_prefix}翻牌结果：{revealed_cards}\n发起方：{challenger}\n{result}")],
+            )
         )
 
         punished = room.players.get(punished_id)
         if not punished or not punished.alive:
-            await self._send_group_text(room, "受罚玩家状态异常，直接进入下一小局。")
-            await self._start_new_round_locked(room, reason="异常恢复")
-            return
+            update.outbox.append((room.group_umo, [Comp.Plain("受罚玩家状态异常，直接进入下一小局。")]))
+            next_update = self._start_new_round_locked(room, reason="异常恢复")
+            update.outbox.extend(next_update.outbox)
+            update.hand_push.extend(next_update.hand_push)
+            return update
 
         room.phase = PHASE_AWAIT_WIRE
         room.pending_wire_user_id = punished_id
@@ -1274,16 +1332,18 @@ class LiarsBarBasicPlugin(Star):
                 )
             )
         )
-        await self._send_to_umo(room.group_umo, chain)
+        update.outbox.append((room.group_umo, chain))
+        return update
 
-    async def _apply_wire_cut_locked(self, room: RoomState, user_id: str, color: str, by_timeout: bool) -> None:
+    def _apply_wire_cut_locked(self, room: RoomState, user_id: str, color: str, by_timeout: bool) -> RoundUpdate:
+        update = RoundUpdate()
         player = room.players.get(user_id)
         if not player:
-            return
+            return update
 
         options = room.wire_options.copy()
         if color not in options:
-            return
+            return update
 
         if color in player.wires_remaining:
             player.wires_remaining.remove(color)
@@ -1308,29 +1368,40 @@ class LiarsBarBasicPlugin(Star):
             if explode.exists():
                 chain.append(Comp.Image.fromFileSystem(str(explode)))
             chain.append(Comp.Plain(self._guide("", "本小局结束，系统将开始下一小局。")))
-            await self._send_to_umo(room.group_umo, chain)
+            update.outbox.append((room.group_umo, chain))
         else:
             remain = "、".join(player.wires_remaining)
-            await self._send_group_text(
-                room,
-                self._guide(
-                    f"{prefix}{who} 剪到【{color}线】并安全通过。剩余线：{remain}",
-                    "本小局结束，系统将开始下一小局。",
-                ),
+            update.outbox.append(
+                (
+                    room.group_umo,
+                    [
+                        Comp.Plain(
+                            self._guide(
+                                f"{prefix}{who} 剪到【{color}线】并安全通过。剩余线：{remain}",
+                                "本小局结束，系统将开始下一小局。",
+                            )
+                        )
+                    ],
+                )
             )
 
         alive = room.alive_ids()
         if len(alive) <= 1:
-            await self._announce_winner_and_close_locked(room, reason="决出唯一幸存者")
-            return
+            end_update = self._announce_winner_and_close_locked(room, reason="决出唯一幸存者")
+            update.outbox.extend(end_update.outbox)
+            update.hand_push.extend(end_update.hand_push)
+            return update
 
-        await self._start_new_round_locked(room, reason="剪线结算后")
+        next_update = self._start_new_round_locked(room, reason="剪线结算后")
+        update.outbox.extend(next_update.outbox)
+        update.hand_push.extend(next_update.hand_push)
+        return update
 
-    async def _start_new_round_locked(self, room: RoomState, reason: str) -> None:
+    def _start_new_round_locked(self, room: RoomState, reason: str) -> RoundUpdate:
+        update = RoundUpdate()
         alive_ids = room.alive_ids()
         if len(alive_ids) <= 1:
-            await self._announce_winner_and_close_locked(room, reason="仅剩一名玩家")
-            return
+            return self._announce_winner_and_close_locked(room, reason="仅剩一名玩家")
 
         for uid in room.order:
             if uid in room.players:
@@ -1340,12 +1411,14 @@ class LiarsBarBasicPlugin(Star):
         deck = self._build_round_deck(room)
         need = hand_size * len(alive_ids)
         if len(deck) < need:
-            await self._send_group_text(
-                room,
-                self._guide("牌池数据异常，无法继续发牌，已终止本局。", "请重新发送 /酒馆 开房。"),
+            update.outbox.append(
+                (
+                    room.group_umo,
+                    [Comp.Plain(self._guide("牌池数据异常，无法继续发牌，已终止本局。", "请重新发送 /酒馆 开房。"))],
+                )
             )
             self._drop_room_locked(room.room_id)
-            return
+            return update
         for uid in alive_ids:
             take = deck[:hand_size]
             deck = deck[hand_size:]
@@ -1385,22 +1458,12 @@ class LiarsBarBasicPlugin(Star):
                 )
             )
         )
-        await self._send_to_umo(room.group_umo, chain)
+        update.outbox.append((room.group_umo, chain))
+        update.hand_push.extend(alive_ids)
+        return update
 
-        for uid in alive_ids:
-            try:
-                await self._send_private_hand(room, uid, force_tip=False)
-            except Exception:
-                # Avoid breaking the whole round flow if one player's private channel is unavailable.
-                await self._send_to_umo(
-                    room.group_umo,
-                    [
-                        Comp.At(qq=uid),
-                        Comp.Plain(" 私聊发牌失败，请先加好友并私聊机器人一次。"),
-                    ],
-                )
-
-    async def _announce_winner_and_close_locked(self, room: RoomState, reason: str) -> None:
+    def _announce_winner_and_close_locked(self, room: RoomState, reason: str) -> RoundUpdate:
+        update = RoundUpdate()
         alive_ids = room.alive_ids()
         if alive_ids:
             winner_id = alive_ids[0]
@@ -1411,8 +1474,9 @@ class LiarsBarBasicPlugin(Star):
             )
         else:
             text = self._guide("大局结束：无幸存者。", "如需再玩，请发送 /酒馆 开房。")
-        await self._send_group_text(room, text)
+        update.outbox.append((room.group_umo, [Comp.Plain(text)]))
         self._drop_room_locked(room.room_id)
+        return update
 
     async def _send_private_hand(self, room: RoomState, user_id: str, force_tip: bool) -> None:
         player = room.players.get(user_id)
@@ -1452,10 +1516,11 @@ class LiarsBarBasicPlugin(Star):
 
         await self._send_private_text(room, user_id, info, image_path=hand_img)
 
-    async def _probe_private_reachable(self, room: RoomState, user_id: str) -> bool:
+    async def _probe_private_reachable(self, platform_id: str, user_id: str) -> bool:
         text = "[酒馆连通检查] 收到这条消息代表私聊通道可用。"
         try:
-            await self._send_private_text(room, user_id, text)
+            session = self._private_umo(platform_id, user_id)
+            await self._send_to_umo(session, [Comp.Plain(text)])
             return True
         except Exception:
             return False
@@ -1484,6 +1549,8 @@ class LiarsBarBasicPlugin(Star):
             await self._send_group_text(room, fallback)
 
     async def _handle_play_timeout(self, room_id: str, token: int, target_uid: str) -> None:
+        update = RoundUpdate()
+        room_snapshot: Optional[RoomState] = None
         async with self.state_lock:
             room = self.rooms.get(room_id)
             if not room:
@@ -1506,27 +1573,36 @@ class LiarsBarBasicPlugin(Star):
             room.play_deadline_ts = 0
             self._cancel_play_timeout_task(room_id)
 
-            await self._send_to_umo(
-                room.group_umo,
-                [
-                    Comp.At(qq=target_uid),
-                    Comp.Plain(
-                        f" 出牌超时 {self._play_timeout_seconds()} 秒，直接整局淘汰。\n"
-                        + self._guide("", "本小局结束，系统将自动开始下一小局。")
-                    ),
-                ],
+            update.outbox.append(
+                (
+                    room.group_umo,
+                    [
+                        Comp.At(qq=target_uid),
+                        Comp.Plain(
+                            f" 出牌超时 {self._play_timeout_seconds()} 秒，直接整局淘汰。\n"
+                            + self._guide("", "本小局结束，系统将自动开始下一小局。")
+                        ),
+                    ],
+                )
             )
 
             if len(room.alive_ids()) <= 1:
-                await self._announce_winner_and_close_locked(room, reason="超时淘汰后仅剩一人")
-                await self._save_state_locked()
-                return
-
-            await self._start_new_round_locked(room, reason="超时淘汰结算")
+                end_update = self._announce_winner_and_close_locked(room, reason="超时淘汰后仅剩一人")
+                update.outbox.extend(end_update.outbox)
+                update.hand_push.extend(end_update.hand_push)
+            else:
+                next_update = self._start_new_round_locked(room, reason="超时淘汰结算")
+                update.outbox.extend(next_update.outbox)
+                update.hand_push.extend(next_update.hand_push)
             room.updated_at = time.time()
             await self._save_state_locked()
+            if room.room_id in self.rooms:
+                room_snapshot = copy.deepcopy(room)
+        await self._dispatch_round_update(room_snapshot, update)
 
     async def _handle_wire_timeout(self, room_id: str, token: int, target_uid: str) -> None:
+        update = RoundUpdate()
+        room_snapshot: Optional[RoomState] = None
         async with self.state_lock:
             room = self.rooms.get(room_id)
             if not room:
@@ -1541,14 +1617,16 @@ class LiarsBarBasicPlugin(Star):
                 return
 
             if not room.wire_options:
-                await self._start_new_round_locked(room, reason="剪线状态修复")
+                update = self._start_new_round_locked(room, reason="剪线状态修复")
                 await self._save_state_locked()
-                return
-
-            picked = random.choice(room.wire_options)
-            await self._apply_wire_cut_locked(room, target_uid, picked, by_timeout=True)
-            room.updated_at = time.time()
-            await self._save_state_locked()
+            else:
+                picked = random.choice(room.wire_options)
+                update = self._apply_wire_cut_locked(room, target_uid, picked, by_timeout=True)
+                room.updated_at = time.time()
+                await self._save_state_locked()
+            if room.room_id in self.rooms:
+                room_snapshot = copy.deepcopy(room)
+        await self._dispatch_round_update(room_snapshot, update)
 
     def _arm_play_timeout_task(self, room_id: str, token: int, target_uid: str, deadline_ts: float) -> None:
         self._cancel_play_timeout_task(room_id)
@@ -1639,6 +1717,7 @@ class LiarsBarBasicPlugin(Star):
     async def _cleanup_rooms(self) -> None:
         ttl_seconds = max(60, int(self.conf.get("room_ttl_minutes", 180)) * 60)
         now = time.time()
+        outbox: list[tuple[str, list[Any]]] = []
         async with self.state_lock:
             stale = [
                 rid
@@ -1651,10 +1730,34 @@ class LiarsBarBasicPlugin(Star):
             for rid in stale:
                 room = self.rooms.get(rid)
                 if room:
-                    await self._send_group_text(room, "房间等待超时已自动关闭。")
+                    outbox.append((room.group_umo, [Comp.Plain("房间等待超时已自动关闭。")]))
                 self._drop_room_locked(rid)
 
             await self._save_state_locked()
+        if outbox:
+            await self._flush_outbox(outbox)
+
+    async def _flush_outbox(self, outbox: list[tuple[str, list[Any]]]) -> None:
+        for umo, chain in outbox:
+            await self._send_to_umo(umo, chain)
+
+    async def _dispatch_round_update(self, room_snapshot: Optional[RoomState], update: RoundUpdate) -> None:
+        if update.outbox:
+            await self._flush_outbox(update.outbox)
+        if not room_snapshot or not update.hand_push:
+            return
+
+        for uid in update.hand_push:
+            try:
+                await self._send_private_hand(room_snapshot, uid, force_tip=False)
+            except Exception:
+                await self._send_to_umo(
+                    room_snapshot.group_umo,
+                    [
+                        Comp.At(qq=uid),
+                        Comp.Plain(" 私聊发牌失败，请先加好友并私聊机器人一次。"),
+                    ],
+                )
 
     async def _send_group_text(self, room: RoomState, text: str) -> None:
         await self._send_to_umo(room.group_umo, [Comp.Plain(text)])
@@ -1813,13 +1916,10 @@ class LiarsBarBasicPlugin(Star):
         )
 
     def _load_state(self) -> None:
-        if not self.state_path.exists():
-            return
-        try:
-            with self.state_path.open("r", encoding="utf-8") as f:
-                raw = json.load(f)
-        except Exception as exc:
-            logger.error(f"酒馆读取状态失败: {exc}")
+        raw = self.state_repo.load()
+        if raw is None:
+            if self.state_path.exists():
+                logger.error("酒馆读取状态失败: 状态文件解析失败")
             return
 
         rooms_raw = raw.get("rooms", {}) if isinstance(raw, dict) else {}
@@ -1891,12 +1991,7 @@ class LiarsBarBasicPlugin(Star):
             "rooms": {rid: room.to_dict() for rid, room in self.rooms.items()},
             "player_room_index": self.player_room_index,
         }
-        tmp = self.state_path.with_suffix(".tmp")
         try:
-            with tmp.open("w", encoding="utf-8") as f:
-                json.dump(payload, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, self.state_path)
+            self.state_repo.save(payload)
         except Exception as exc:
             logger.error(f"酒馆保存状态失败: {exc}")
-            with contextlib.suppress(Exception):
-                tmp.unlink()
