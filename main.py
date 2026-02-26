@@ -12,12 +12,11 @@ from typing import Any, Optional
 import astrbot.core.message.components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.config.astrbot_config import AstrBotConfig
 from astrbot.core.message.message_event_result import MessageChain
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.platform.message_type import MessageType
-from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
 PLUGIN_NAME = "astrbot_plugin_liars_bar_basic"
 
@@ -253,13 +252,16 @@ class RoomState:
 class AssetRenderer:
     def __init__(self, assets_dir: Path, cache_dir: Path):
         self.assets_dir = assets_dir
+        self.plugin_dir = assets_dir.parent
         self.cards_dir = assets_dir / "cards"
         self.bombs_dir = assets_dir / "bombs"
+        self.fonts_dir = assets_dir / "fonts"
         self.cache_dir = cache_dir
 
     def ensure_assets(self) -> None:
         self.cards_dir.mkdir(parents=True, exist_ok=True)
         self.bombs_dir.mkdir(parents=True, exist_ok=True)
+        self.fonts_dir.mkdir(parents=True, exist_ok=True)
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         if not PIL_AVAILABLE:
             return
@@ -525,17 +527,26 @@ class AssetRenderer:
 
         img.convert("RGB").save(out_path, format="PNG")
 
-    @staticmethod
-    def _pick_font(size: int) -> ImageFont.ImageFont:
-        candidates = [
-            "/root/AstrBot/data/plugins/astrbot_plugin_gaokao_sim/assets/fonts/SourceHanSansSC-Regular.otf",
-            "/root/AstrBot/data/plugins/astrbot_plugin_parser/core/resources/HYSongYunLangHeiW-1.ttf",
+    def _preferred_font_candidates(self) -> list[str]:
+        sudoku_font_candidates = [
+            self.plugin_dir.parent / "astrbot_plugin_sudoku" / "assets" / "LXGWWenKai-Regular.ttf",
+            self.plugin_dir.parent / "astrbot_plugin_sudoku" / "assets" / "fonts" / "LXGWWenKai-Regular.ttf",
+        ]
+        local_font_candidates = [
+            self.fonts_dir / "LXGWWenKai-Regular.ttf",
+            self.fonts_dir / "NotoSansCJK-Regular.ttc",
+            self.fonts_dir / "SourceHanSansSC-Regular.otf",
+        ]
+        system_candidates = [
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         ]
-        for path in candidates:
+        return [str(p) for p in sudoku_font_candidates + local_font_candidates] + system_candidates
+
+    def _pick_font(self, size: int) -> ImageFont.ImageFont:
+        for path in self._preferred_font_candidates():
             if os.path.exists(path):
                 try:
                     return ImageFont.truetype(path, size=size)
@@ -543,12 +554,11 @@ class AssetRenderer:
                     continue
         return ImageFont.load_default()
 
-    @staticmethod
-    def _pick_number_font(size: int) -> ImageFont.ImageFont:
+    def _pick_number_font(self, size: int) -> ImageFont.ImageFont:
         candidates = [
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        ]
+        ] + self._preferred_font_candidates()
         for path in candidates:
             if os.path.exists(path):
                 try:
@@ -572,8 +582,7 @@ class LiarsBarBasicPlugin(Star):
         self.plugin_dir = Path(__file__).resolve().parent
         self.assets_dir = self.plugin_dir / "assets"
 
-        self.data_dir = Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
-        self.data_dir.mkdir(parents=True, exist_ok=True)
+        self.data_dir = Path(StarTools.get_data_dir(PLUGIN_NAME))
         self.cache_dir = self.data_dir / "cache"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.state_path = self.data_dir / "state.json"

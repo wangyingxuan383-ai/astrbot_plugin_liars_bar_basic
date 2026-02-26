@@ -59,9 +59,41 @@ AstrBot QQ 群聊《骗子酒馆基础版》插件（3~5 人）。
 - `require_dm_reachable_before_start`：开局前检查私聊可达
 - `room_ttl_minutes`：等待阶段房间自动回收分钟数
 
+## 数据持久化目录
+- 插件数据目录通过 `StarTools.get_data_dir(PLUGIN_NAME)` 获取。
+- 默认会落在 AstrBot 规范目录：`data/plugin_data/astrbot_plugin_liars_bar_basic`。
+- 持久化文件：
+- `state.json`：房间状态
+- `cache/`：临时渲染图缓存
+
+## 字体策略（兼容无本地字体环境）
+- 优先级 1：若安装了 `astrbot_plugin_sudoku`，优先复用：
+- `astrbot_plugin_sudoku/assets/LXGWWenKai-Regular.ttf`
+- 优先级 2：使用本插件内字体目录：
+- `assets/fonts/LXGWWenKai-Regular.ttf`
+- 优先级 3：系统字体回退（Noto/WenQuanYi/DejaVu）
+
+### 未安装数独插件时，如何准备字体
+1. 创建字体目录：
+```bash
+mkdir -p assets/fonts
+```
+2. 下载霞鹜文楷（推荐）到本插件目录：
+```bash
+wget -O assets/fonts/LXGWWenKai-Regular.ttf \
+  https://github.com/lxgw/LxgwWenKai/releases/download/v1.510/LXGWWenKai-Regular.ttf
+```
+3. 若没有 `wget`，可改用：
+```bash
+curl -L -o assets/fonts/LXGWWenKai-Regular.ttf \
+  https://github.com/lxgw/LxgwWenKai/releases/download/v1.510/LXGWWenKai-Regular.ttf
+```
+4. 下载页面（备用）：`https://github.com/lxgw/LxgwWenKai/releases`
+
 ## 目录结构
 - `main.py`：核心逻辑（状态机、命令、超时、结算）
 - `assets/cards/*.png`：卡牌与目标牌图
 - `assets/bombs/*.png`：炸弹状态图与爆炸图
+- `assets/fonts/`：本插件可选字体目录（无数独插件时使用）
 - `_conf_schema.json`：配置定义
 - `requirements.txt`：依赖声明
