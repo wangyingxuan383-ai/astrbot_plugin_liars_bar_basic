@@ -1,0 +1,7 @@
+name: astrbot_plugin_liars_bar_basic
+display_name: 骗子酒馆基础版
+desc: |-
+  QQ群聊可玩的骗子酒馆基础版：3~5人、私聊暗牌、多牌出牌、剪线淘汰、目标牌小局图。
+version: v0.1.0
+author: codex
+repo: local

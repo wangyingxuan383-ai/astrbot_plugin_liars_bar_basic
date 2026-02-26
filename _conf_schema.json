@@ -1,0 +1,38 @@
+{
+  "play_timeout_seconds": {
+    "description": "出牌超时秒数",
+    "type": "int",
+    "default": 90,
+    "hint": "当前行动玩家在私聊提交 /酒馆 出 的超时秒数，超时直接整局淘汰"
+  },
+  "wire_timeout_seconds": {
+    "description": "剪线超时秒数",
+    "type": "int",
+    "default": 60,
+    "hint": "待剪线玩家在群内提交 /酒馆 剪线 的超时秒数，超时将自动随机剪线"
+  },
+  "guide_mode": {
+    "description": "启用指引文案",
+    "type": "bool",
+    "default": true,
+    "hint": "每次回复末尾都附下一步建议指令"
+  },
+  "hand_image_width": {
+    "description": "手牌拼图宽度",
+    "type": "int",
+    "default": 960,
+    "hint": "私聊手牌拼图的目标宽度，值越大图片越宽"
+  },
+  "require_dm_reachable_before_start": {
+    "description": "开始前检查私聊可达",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后开局前会尝试私聊所有玩家，失败则阻止开局并提示先加好友"
+  },
+  "room_ttl_minutes": {
+    "description": "房间无操作清理分钟",
+    "type": "int",
+    "default": 180,
+    "hint": "等待中房间长时间无操作会被回收"
+  }
+}
