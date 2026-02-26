@@ -73,6 +73,13 @@ AstrBot QQ 群聊《骗子酒馆基础版》插件（3~5 人）。
 - `assets/fonts/LXGWWenKai-Regular.ttf`
 - 优先级 3：系统字体回退（Noto/WenQuanYi/DejaVu）
 
+### 数独插件仓库（用于复用字体）
+- `https://github.com/wangyingxuan383-ai/astrbot_plugin_sudoku`
+
+### 提醒
+- 复用数独字体是“可选优化”，不是强依赖；未安装数独插件时本插件仍可运行。
+- 若数独插件不在标准目录或字体文件名变更，请改用本插件 `assets/fonts/` 方案，避免渲染中文失败。
+
 ### 未安装数独插件时，如何准备字体
 1. 创建字体目录：
 ```bash
