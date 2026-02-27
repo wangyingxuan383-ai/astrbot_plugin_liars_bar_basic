@@ -34,5 +34,47 @@
     "type": "int",
     "default": 180,
     "hint": "等待中房间长时间无操作会被回收"
+  },
+  "ai_enabled": {
+    "description": "启用 AI 玩家",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后房主可在等待阶段使用 /酒馆 加AI 和 /酒馆 减AI"
+  },
+  "ai_provider_id": {
+    "description": "AI 固定 Provider ID",
+    "type": "string",
+    "default": "",
+    "hint": "留空则不调用模型，AI 直接使用本地规则策略"
+  },
+  "ai_llm_timeout_seconds": {
+    "description": "AI 模型调用超时秒数",
+    "type": "int",
+    "default": 12,
+    "hint": "每次 AI 调用固定 Provider 的超时限制"
+  },
+  "ai_llm_retry_times": {
+    "description": "AI 模型重试次数",
+    "type": "int",
+    "default": 1,
+    "hint": "模型失败后的额外重试次数，超限后自动规则兜底"
+  },
+  "ai_taunt_enabled": {
+    "description": "AI 简短嘲讽开关",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后 AI 在关键动作后可能发送一条短台词"
+  },
+  "ai_taunt_probability": {
+    "description": "AI 嘲讽概率",
+    "type": "float",
+    "default": 0.35,
+    "hint": "每次 AI 动作触发简短嘲讽的概率，范围 0~1"
+  },
+  "ai_max_play_cards": {
+    "description": "AI 单次最多出牌数",
+    "type": "int",
+    "default": 3,
+    "hint": "仅限制 AI 每次暗出的最大张数，不影响人类玩家"
   }
 }

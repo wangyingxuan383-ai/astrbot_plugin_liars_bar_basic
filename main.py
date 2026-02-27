@@ -57,6 +57,10 @@ WIRE_ALIASES = {
 DEFAULT_PLAY_TIMEOUT_SECONDS = 120
 DEFAULT_WIRE_TIMEOUT_SECONDS = 120
 FIXED_HAND_SIZE = 5
+DEFAULT_AI_LLM_TIMEOUT_SECONDS = 12
+DEFAULT_AI_LLM_RETRY_TIMES = 1
+DEFAULT_AI_MAX_PLAY_CARDS = 3
+DEFAULT_AI_TAUNT_PROBABILITY = 0.35
 DECK_DISTRIBUTION_WEIGHTS = {
     CARD_SUN: 3,
     CARD_MOON: 3,
@@ -67,6 +71,27 @@ DECK_DISTRIBUTION_WEIGHTS = {
 PHASE_WAITING = "waiting"
 PHASE_PLAYING = "playing"
 PHASE_AWAIT_WIRE = "await_wire"
+
+AI_TAUNTS = {
+    "play": [
+        "这手够你想一会了。",
+        "杯沿已敲，轮到你了。",
+        "这回合我先压一手。",
+        "牌在桌上，自己判断。",
+    ],
+    "challenge": [
+        "你这话我不信。",
+        "翻开看看真假。",
+        "酒馆不收空话。",
+        "这一手我要抓你。",
+    ],
+    "wire": [
+        "赌命的时候到了。",
+        "别眨眼，见分晓。",
+        "我剪这一根。",
+        "听天由命吧。",
+    ],
+}
 
 try:
     from PIL import Image, ImageDraw, ImageFilter, ImageFont
@@ -80,6 +105,8 @@ except Exception:
 class PlayerState:
     user_id: str
     name: str
+    is_ai: bool = False
+    ai_label: str = ""
     alive: bool = True
     hand: list[str] = field(default_factory=list)
     bomb_color: str = ""
@@ -91,12 +118,14 @@ class PlayerState:
         self.hand = []
         self.bomb_color = random.choice(WIRE_COLORS)
         self.wires_remaining = WIRE_COLORS.copy()
-        self.dm_reachable = False
+        self.dm_reachable = self.is_ai
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "user_id": self.user_id,
             "name": self.name,
+            "is_ai": self.is_ai,
+            "ai_label": self.ai_label,
             "alive": self.alive,
             "hand": self.hand,
             "bomb_color": self.bomb_color,
@@ -109,6 +138,8 @@ class PlayerState:
         return cls(
             user_id=str(data.get("user_id", "")),
             name=str(data.get("name", "")),
+            is_ai=bool(data.get("is_ai", False)),
+            ai_label=str(data.get("ai_label", "")),
             alive=bool(data.get("alive", True)),
             hand=list(data.get("hand", []) or []),
             bomb_color=str(data.get("bomb_color", "")),
@@ -172,6 +203,7 @@ class RoomState:
     play_deadline_ts: float = 0.0
     wire_deadline_ts: float = 0.0
     action_token: int = 0
+    ai_seq: int = 0
 
     def alive_ids(self) -> list[str]:
         return [uid for uid in self.order if uid in self.players and self.players[uid].alive]
@@ -206,6 +238,7 @@ class RoomState:
             "play_deadline_ts": self.play_deadline_ts,
             "wire_deadline_ts": self.wire_deadline_ts,
             "action_token": self.action_token,
+            "ai_seq": self.ai_seq,
         }
 
     @classmethod
@@ -237,6 +270,7 @@ class RoomState:
             play_deadline_ts=float(data.get("play_deadline_ts", 0.0)),
             wire_deadline_ts=float(data.get("wire_deadline_ts", 0.0)),
             action_token=int(data.get("action_token", 0)),
+            ai_seq=int(data.get("ai_seq", 0)),
         )
         players_raw = data.get("players", {}) or {}
         room.players = {
@@ -600,7 +634,7 @@ class AssetRenderer:
         return max(0, int(bbox[2] - bbox[0]))
 
 
-@register(PLUGIN_NAME, "金幺", "骗子酒馆基础版（本地素材）", "0.1.0", "local")
+@register(PLUGIN_NAME, "金幺", "骗子酒馆基础版（本地素材）", "0.2.0", "local")
 class LiarsBarBasicPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -624,6 +658,8 @@ class LiarsBarBasicPlugin(Star):
 
         self.play_timeout_tasks: dict[str, asyncio.Task] = {}
         self.wire_timeout_tasks: dict[str, asyncio.Task] = {}
+        self.ai_action_tasks: dict[str, asyncio.Task] = {}
+        self.ai_action_task_tokens: dict[str, int] = {}
         self.cleanup_task: Optional[asyncio.Task] = None
 
         self._load_state()
@@ -631,6 +667,7 @@ class LiarsBarBasicPlugin(Star):
     async def initialize(self):
         self.renderer.ensure_assets()
         await self._resume_timers()
+        await self._resume_ai_actions()
         self.cleanup_task = asyncio.create_task(self._cleanup_loop())
 
     async def terminate(self):
@@ -640,14 +677,44 @@ class LiarsBarBasicPlugin(Star):
             task.cancel()
         for task in list(self.wire_timeout_tasks.values()):
             task.cancel()
+        for task in list(self.ai_action_tasks.values()):
+            task.cancel()
         self.play_timeout_tasks.clear()
         self.wire_timeout_tasks.clear()
+        self.ai_action_tasks.clear()
+        self.ai_action_task_tokens.clear()
 
     def _play_timeout_seconds(self) -> int:
         return max(1, int(self.conf.get("play_timeout_seconds", DEFAULT_PLAY_TIMEOUT_SECONDS)))
 
     def _wire_timeout_seconds(self) -> int:
         return max(1, int(self.conf.get("wire_timeout_seconds", DEFAULT_WIRE_TIMEOUT_SECONDS)))
+
+    def _ai_enabled(self) -> bool:
+        return bool(self.conf.get("ai_enabled", True))
+
+    def _ai_provider_id(self) -> str:
+        return str(self.conf.get("ai_provider_id", "")).strip()
+
+    def _ai_llm_timeout_seconds(self) -> int:
+        return max(1, int(self.conf.get("ai_llm_timeout_seconds", DEFAULT_AI_LLM_TIMEOUT_SECONDS)))
+
+    def _ai_llm_retry_times(self) -> int:
+        return max(0, int(self.conf.get("ai_llm_retry_times", DEFAULT_AI_LLM_RETRY_TIMES)))
+
+    def _ai_taunt_enabled(self) -> bool:
+        return bool(self.conf.get("ai_taunt_enabled", True))
+
+    def _ai_taunt_probability(self) -> float:
+        value = self.conf.get("ai_taunt_probability", DEFAULT_AI_TAUNT_PROBABILITY)
+        try:
+            prob = float(value)
+        except Exception:
+            prob = DEFAULT_AI_TAUNT_PROBABILITY
+        return max(0.0, min(1.0, prob))
+
+    def _ai_max_play_cards(self) -> int:
+        return max(1, int(self.conf.get("ai_max_play_cards", DEFAULT_AI_MAX_PLAY_CARDS)))
 
     def _build_locked_deck_counts(self, start_player_count: int) -> dict[str, int]:
         # Lock total cards at game start: players * 5.
@@ -701,6 +768,7 @@ class LiarsBarBasicPlugin(Star):
             "发牌规则：每小局先清空上局手牌，再给当前存活玩家每人固定发 5 张。"
             "\n卡池规则：在 /酒馆 开始 时按开局人数一次锁定总牌数（3人=15张，4人=20张，5人=25张），后续小局不再改变。"
             "\n牌型按比例分配（太阳/月亮/星星/魔术=3/3/3/1），保证每局结构稳定。"
+            "\nAI扩展：房主可在等待阶段使用 /酒馆 加AI [数量] 或 /酒馆 减AI [数量] 调整机器人人数。"
         )
 
     @filter.command("酒馆", alias={"骗子酒馆", "liarsbar"})
@@ -734,6 +802,14 @@ class LiarsBarBasicPlugin(Star):
 
         if cmd in {"加入", "join"}:
             await self._cmd_join_room(event)
+            return
+
+        if cmd in {"加ai", "添加ai", "addai", "add_ai"}:
+            await self._cmd_add_ai(event, args)
+            return
+
+        if cmd in {"减ai", "移除ai", "removeai", "remove_ai"}:
+            await self._cmd_remove_ai(event, args)
             return
 
         if cmd in {"开始", "start"}:
@@ -771,6 +847,14 @@ class LiarsBarBasicPlugin(Star):
             "create",
             "加入",
             "join",
+            "加ai",
+            "添加ai",
+            "addai",
+            "add_ai",
+            "减ai",
+            "移除ai",
+            "removeai",
+            "remove_ai",
             "开始",
             "start",
             "状态",
@@ -848,7 +932,7 @@ class LiarsBarBasicPlugin(Star):
                 await self._save_state_locked()
                 msg = self._guide(
                     f"开房成功。你是房主，当前 1/5 人。\n{self._room_create_card_intro()}",
-                    "让其他人发送 /酒馆 加入；人数达到 3~5 人后你发送 /酒馆 开始。",
+                    "让其他人发送 /酒馆 加入；也可先 /酒馆 加AI。人数达到 3~5 后你发送 /酒馆 开始。",
                 )
 
         await event.send(event.plain_result(msg))
@@ -885,8 +969,118 @@ class LiarsBarBasicPlugin(Star):
                 owner_name = room.players.get(room.owner_id).name if room.owner_id in room.players else room.owner_name
                 msg = self._guide(
                     f"加入成功，当前 {count}/5 人。房主：{owner_name}",
-                    "人数达到 3~5 后，房主发送 /酒馆 开始。",
+                    "人数达到 3~5 后，房主可 /酒馆 开始（也可先 /酒馆 加AI 调整人数）。",
                 )
+        await event.send(event.plain_result(msg))
+
+    async def _cmd_add_ai(self, event: AstrMessageEvent, args: list[str]) -> None:
+        room_id = event.unified_msg_origin
+        user_id = str(event.get_sender_id())
+
+        if not self._ai_enabled():
+            msg = self._guide("当前已关闭 AI 玩家功能。", "如需启用，请在插件配置中打开 ai_enabled。")
+            await event.send(event.plain_result(msg))
+            return
+
+        count = self._parse_count_arg(args, default=1)
+        if count is None:
+            msg = self._guide("数量参数无效。", "用法：/酒馆 加AI [数量]，数量需为正整数。")
+            await event.send(event.plain_result(msg))
+            return
+
+        msg = ""
+        async with self.state_lock:
+            room = self.rooms.get(room_id)
+            if not room:
+                msg = self._guide("本群当前没有房间。", "先由一名玩家发送 /酒馆 开房。")
+            elif room.phase != PHASE_WAITING:
+                msg = self._guide("只允许在等待阶段调整 AI。", "请等待本局结束后再调整。")
+            elif user_id != room.owner_id:
+                msg = self._guide("只有房主可以调整 AI 人数。", "请房主发送 /酒馆 加AI。")
+            else:
+                human_count = sum(1 for uid in room.order if uid in room.players and not room.players[uid].is_ai)
+                if human_count <= 0:
+                    msg = self._guide("房间内至少需要 1 名人类玩家。", "请先让真人玩家加入。")
+                else:
+                    available = max(0, 5 - len(room.order))
+                    if available <= 0:
+                        msg = self._guide("房间人数已满（5人）。", "可先用 /酒馆 减AI 或直接 /酒馆 开始。")
+                    else:
+                        add_n = min(count, available)
+                        added_names: list[str] = []
+                        for _ in range(add_n):
+                            ai_uid, ai_name = self._alloc_ai_identity_locked(room)
+                            ai_player = PlayerState(
+                                user_id=ai_uid,
+                                name=ai_name,
+                                is_ai=True,
+                                ai_label=ai_name,
+                                dm_reachable=True,
+                            )
+                            ai_player.bomb_color = random.choice(WIRE_COLORS)
+                            room.players[ai_uid] = ai_player
+                            room.order.append(ai_uid)
+                            added_names.append(ai_name)
+
+                        room.updated_at = time.time()
+                        await self._save_state_locked()
+
+                        if add_n < count:
+                            msg = self._guide(
+                                f"已添加 {add_n} 名 AI（达到人数上限）。当前人数 {len(room.order)}/5：{', '.join(added_names)}",
+                                "人数满足后，房主可发送 /酒馆 开始。",
+                            )
+                        else:
+                            msg = self._guide(
+                                f"已添加 {add_n} 名 AI。当前人数 {len(room.order)}/5：{', '.join(added_names)}",
+                                "继续等待玩家加入，或由房主发送 /酒馆 开始。",
+                            )
+        await event.send(event.plain_result(msg))
+
+    async def _cmd_remove_ai(self, event: AstrMessageEvent, args: list[str]) -> None:
+        room_id = event.unified_msg_origin
+        user_id = str(event.get_sender_id())
+
+        count = self._parse_count_arg(args, default=1)
+        if count is None:
+            msg = self._guide("数量参数无效。", "用法：/酒馆 减AI [数量]，数量需为正整数。")
+            await event.send(event.plain_result(msg))
+            return
+
+        msg = ""
+        async with self.state_lock:
+            room = self.rooms.get(room_id)
+            if not room:
+                msg = self._guide("本群当前没有房间。", "先由一名玩家发送 /酒馆 开房。")
+            elif room.phase != PHASE_WAITING:
+                msg = self._guide("只允许在等待阶段调整 AI。", "请等待本局结束后再调整。")
+            elif user_id != room.owner_id:
+                msg = self._guide("只有房主可以调整 AI 人数。", "请房主发送 /酒馆 减AI。")
+            else:
+                human_count = sum(1 for uid in room.order if uid in room.players and not room.players[uid].is_ai)
+                if human_count <= 0:
+                    msg = self._guide("房间内至少需要 1 名人类玩家。", "请先让真人玩家加入。")
+                else:
+                    ai_ids = [uid for uid in room.order if uid in room.players and room.players[uid].is_ai]
+                    if not ai_ids:
+                        msg = self._guide("当前房间没有 AI 玩家。", "如需添加请用 /酒馆 加AI。")
+                    else:
+                        remove_n = min(count, len(ai_ids))
+                        remove_ids = list(reversed(ai_ids))[:remove_n]
+                        removed_names: list[str] = []
+                        for rid in remove_ids:
+                            player = room.players.pop(rid, None)
+                            if player:
+                                removed_names.append(player.name)
+                            room.order = [uid for uid in room.order if uid != rid]
+                            self.player_room_index.pop(rid, None)
+
+                        room.updated_at = time.time()
+                        await self._save_state_locked()
+                        msg = self._guide(
+                            f"已移除 {remove_n} 名 AI。当前人数 {len(room.order)}/5：{', '.join(removed_names)}",
+                            "可继续 /酒馆 加AI，或由房主发送 /酒馆 开始。",
+                        )
         await event.send(event.plain_result(msg))
 
     async def _cmd_start_room(self, event: AstrMessageEvent) -> None:
@@ -909,10 +1103,18 @@ class LiarsBarBasicPlugin(Star):
                 err_msg = self._guide("人数不足，至少需要 3 人。", "让更多玩家发送 /酒馆 加入。")
             elif len(room.order) > 5:
                 err_msg = self._guide("人数超过上限 5 人。", "请房主 /酒馆 结束 后重新开房。")
+            elif sum(1 for uid in room.order if uid in room.players and not room.players[uid].is_ai) <= 0:
+                err_msg = self._guide("至少需要 1 名人类玩家。", "请先让真人玩家加入后再开始。")
+            elif not self._ai_enabled() and any(uid in room.players and room.players[uid].is_ai for uid in room.order):
+                err_msg = self._guide("当前 AI 功能已关闭，无法带 AI 开局。", "请先 /酒馆 减AI，或在配置里打开 ai_enabled。")
             else:
                 need_check = bool(self.conf.get("require_dm_reachable_before_start", True))
                 if need_check:
-                    probe_targets = list(room.order)
+                    probe_targets = [
+                        uid
+                        for uid in room.order
+                        if uid in room.players and not room.players[uid].is_ai
+                    ]
                     probe_platform_id = room.platform_id
 
         if err_msg:
@@ -946,10 +1148,18 @@ class LiarsBarBasicPlugin(Star):
                 err_msg = self._guide("只有房主可以开始。", "请房主发送 /酒馆 开始。")
             elif len(room.order) < 3 or len(room.order) > 5:
                 err_msg = self._guide("人数不在 3~5 范围。", "请调整人数后重试 /酒馆 开始。")
+            elif sum(1 for uid in room.order if uid in room.players and not room.players[uid].is_ai) <= 0:
+                err_msg = self._guide("至少需要 1 名人类玩家。", "请先让真人玩家加入后再开始。")
+            elif not self._ai_enabled() and any(uid in room.players and room.players[uid].is_ai for uid in room.order):
+                err_msg = self._guide("当前 AI 功能已关闭，无法带 AI 开局。", "请先 /酒馆 减AI，或在配置里打开 ai_enabled。")
             else:
                 failed: list[str] = []
                 if need_check:
                     for uid in room.order:
+                        player = room.players.get(uid)
+                        if player and player.is_ai:
+                            player.dm_reachable = True
+                            continue
                         ok = bool(probe_results.get(uid, False))
                         room.players[uid].dm_reachable = ok
                         if not ok:
@@ -982,6 +1192,8 @@ class LiarsBarBasicPlugin(Star):
 
                     for uid in room.order:
                         room.players[uid].reset_for_new_game()
+                        if room.players[uid].is_ai or not need_check:
+                            room.players[uid].dm_reachable = True
 
                     update = self._start_new_round_locked(room, reason="大局开始")
                     room.updated_at = time.time()
@@ -1013,7 +1225,7 @@ class LiarsBarBasicPlugin(Star):
                 alive = room.alive_ids()
                 lines = [
                     f"房间状态：{self._phase_label(room.phase)}",
-                    f"房主：{room.players.get(room.owner_id).name if room.owner_id in room.players else room.owner_name}",
+                    f"房主：{self._display_player_name(room, room.owner_id) if room.owner_id in room.players else room.owner_name}",
                     f"玩家数：{len(room.order)}（存活 {len(alive)}）",
                     f"小局：第 {room.round_no} 局",
                 ]
@@ -1022,13 +1234,21 @@ class LiarsBarBasicPlugin(Star):
                     lines.append(f"当前目标牌：{CARD_NAME.get(room.target_card, room.target_card)}")
 
                 if room.phase == PHASE_PLAYING and room.current_turn_user_id:
-                    pname = room.players.get(room.current_turn_user_id).name if room.current_turn_user_id in room.players else room.current_turn_user_id
-                    lines.append(f"当前行动：{pname}（私聊 /酒馆 出 序号...）")
+                    pname = self._display_player_name(room, room.current_turn_user_id)
+                    turn_player = room.players.get(room.current_turn_user_id)
+                    if turn_player and turn_player.is_ai:
+                        lines.append(f"当前行动：{pname}（系统自动执行中）")
+                    else:
+                        lines.append(f"当前行动：{pname}（私聊 /酒馆 出 序号...）")
 
                 if room.phase == PHASE_AWAIT_WIRE and room.pending_wire_user_id:
-                    pname = room.players.get(room.pending_wire_user_id).name if room.pending_wire_user_id in room.players else room.pending_wire_user_id
+                    pname = self._display_player_name(room, room.pending_wire_user_id)
                     opts = ", ".join([f"{idx}={color}" for idx, color in room.wire_index_map.items()])
-                    lines.append(f"待剪线：{pname}（{opts}）")
+                    pending = room.players.get(room.pending_wire_user_id)
+                    if pending and pending.is_ai:
+                        lines.append(f"待剪线：{pname}（系统自动执行，当前可选 {opts}）")
+                    else:
+                        lines.append(f"待剪线：{pname}（{opts}）")
 
                 lines.append("玩家信息：")
                 for uid in room.order:
@@ -1036,9 +1256,14 @@ class LiarsBarBasicPlugin(Star):
                     if not p:
                         continue
                     status = "存活" if p.alive else "出局"
-                    lines.append(f"- {p.name}：{status}，手牌 {len(p.hand)}")
+                    lines.append(f"- {self._display_player_name(room, uid)}：{status}，手牌 {len(p.hand)}")
 
-                guide = "可用 /酒馆 质疑、/酒馆 剪线、/酒馆 结束 或 /酒馆 帮助。"
+                if room.phase == PHASE_WAITING:
+                    guide = "等待阶段：玩家可 /酒馆 加入，房主可 /酒馆 加AI 或 /酒馆 开始。"
+                elif room.phase == PHASE_AWAIT_WIRE:
+                    guide = "剪线阶段：等待受罚玩家 /酒馆 剪线，或等待系统自动处理。"
+                else:
+                    guide = "可用 /酒馆 质疑、/酒馆 剪线、/酒馆 结束 或 /酒馆 帮助。"
                 msg = self._guide("\n".join(lines), guide)
         await event.send(event.plain_result(msg))
 
@@ -1058,7 +1283,7 @@ class LiarsBarBasicPlugin(Star):
             elif not room.last_play:
                 msg = self._guide("还没有可质疑的上一手出牌。", "等待当前行动玩家先私聊出牌。")
             elif challenger_id != room.current_turn_user_id:
-                current_name = room.players.get(room.current_turn_user_id).name if room.current_turn_user_id in room.players else room.current_turn_user_id
+                current_name = self._display_player_name(room, room.current_turn_user_id)
                 msg = self._guide(f"现在应由 {current_name} 决定是否质疑。", "请等待轮到你。")
             else:
                 update = self._resolve_challenge_locked(room, challenger_id, auto=False)
@@ -1091,7 +1316,7 @@ class LiarsBarBasicPlugin(Star):
             elif room.phase != PHASE_AWAIT_WIRE:
                 msg = self._guide("当前不是剪线阶段。", "可用 /酒馆 状态 查看当前阶段。")
             elif user_id != room.pending_wire_user_id:
-                pname = room.players.get(room.pending_wire_user_id).name if room.pending_wire_user_id in room.players else room.pending_wire_user_id
+                pname = self._display_player_name(room, room.pending_wire_user_id)
                 msg = self._guide(f"当前应由 {pname} 剪线。", "请等待该玩家操作。")
             else:
                 picked = self._resolve_wire_arg(args[0], room)
@@ -1124,7 +1349,7 @@ class LiarsBarBasicPlugin(Star):
             elif user_id != room.owner_id and not is_admin:
                 msg = self._guide("仅房主或管理员可以结束房间。", "请让房主发送 /酒馆 结束。")
             else:
-                ender = room.players.get(user_id).name if user_id in room.players else event.get_sender_name()
+                ender = self._display_player_name(room, user_id) if user_id in room.players else event.get_sender_name()
                 outbox.append(
                     (
                         room.group_umo,
@@ -1194,7 +1419,7 @@ class LiarsBarBasicPlugin(Star):
                     elif not player.alive:
                         msg = self._guide("你已出局，不能继续出牌。", "等待本局结束后再开新房。")
                     elif user_id != room.current_turn_user_id:
-                        name = room.players.get(room.current_turn_user_id).name if room.current_turn_user_id in room.players else room.current_turn_user_id
+                        name = self._display_player_name(room, room.current_turn_user_id)
                         msg = self._guide(f"现在轮到 {name}。", "请等待轮到你后再私聊 /酒馆 出。")
                     elif not args:
                         msg = self._guide("用法：/酒馆 出 2 4 5", "先发送 /酒馆 手牌 查看序号。")
@@ -1204,60 +1429,7 @@ class LiarsBarBasicPlugin(Star):
                             msg = self._guide(parsed, "先发送 /酒馆 手牌 查看正确序号后再提交。")
                         else:
                             indices = parsed
-                            played_cards = [player.hand[i - 1] for i in indices]
-                            for idx in sorted(indices, reverse=True):
-                                player.hand.pop(idx - 1)
-
-                            room.last_play = LastPlay(
-                                player_id=user_id,
-                                cards=played_cards,
-                                declared_target=room.target_card,
-                                played_at=time.time(),
-                            )
-
-                            next_uid = self._next_alive_after(room, user_id)
-                            if not next_uid:
-                                update = self._announce_winner_and_close_locked(room, reason="其他玩家已全部出局")
-                            else:
-                                declared = CARD_NAME.get(room.target_card, room.target_card)
-                                card_count = len(played_cards)
-                                pname = player.name
-                                next_name = room.players[next_uid].name if next_uid in room.players else next_uid
-                                update.outbox.append(
-                                    (
-                                        room.group_umo,
-                                        [
-                                            Comp.Plain(
-                                                self._guide(
-                                                    f"{pname} 已暗出 {card_count} 张，并宣称【{declared}】。",
-                                                    f"现在由 {next_name} 决定：群里 /酒馆 质疑，或在私聊直接出牌。",
-                                                )
-                                            )
-                                        ],
-                                    )
-                                )
-
-                                if len(player.hand) == 0:
-                                    room.current_turn_user_id = next_uid
-                                    update.outbox.append((room.group_umo, [Comp.Plain(f"{pname} 已出完手牌，系统自动触发下家质疑。")]))
-                                    challenge_update = self._resolve_challenge_locked(room, next_uid, auto=True)
-                                    update.outbox.extend(challenge_update.outbox)
-                                    update.hand_push.extend(challenge_update.hand_push)
-                                else:
-                                    room.current_turn_user_id = next_uid
-                                    room.phase = PHASE_PLAYING
-                                    room.pending_wire_user_id = ""
-                                    room.wire_options = []
-                                    room.wire_index_map = {}
-                                    room.wire_deadline_ts = 0
-                                    room.action_token += 1
-                                    room.play_deadline_ts = time.time() + self._play_timeout_seconds()
-                                    self._arm_play_timeout_task(room.room_id, room.action_token, room.current_turn_user_id, room.play_deadline_ts)
-                                    update.hand_push.append(user_id)
-                                    done_msg = self._guide(
-                                        f"已提交：你本次暗出 {card_count} 张。",
-                                        "等待群内结算，或稍后再用 /酒馆 手牌 查看最新手牌。",
-                                    )
+                            update, done_msg = self._apply_play_locked(room, user_id, indices, taunt_line="")
 
                             room.updated_at = time.time()
                             await self._save_state_locked()
@@ -1272,6 +1444,74 @@ class LiarsBarBasicPlugin(Star):
         if done_msg:
             await event.send(event.plain_result(done_msg))
 
+    def _apply_play_locked(self, room: RoomState, user_id: str, indices: list[int], taunt_line: str = "") -> tuple[RoundUpdate, str]:
+        update = RoundUpdate()
+        done_msg = ""
+        player = room.players.get(user_id)
+        if not player or not player.alive:
+            return update, done_msg
+
+        max_cards_limit = self._ai_max_play_cards() if player.is_ai else len(player.hand)
+        normalized = self._normalize_indices(indices, len(player.hand), max_cards=max_cards_limit)
+        if not normalized:
+            return update, done_msg
+
+        played_cards = [player.hand[i - 1] for i in normalized]
+        for idx in sorted(normalized, reverse=True):
+            player.hand.pop(idx - 1)
+
+        room.last_play = LastPlay(
+            player_id=user_id,
+            cards=played_cards,
+            declared_target=room.target_card,
+            played_at=time.time(),
+        )
+
+        next_uid = self._next_alive_after(room, user_id)
+        if not next_uid:
+            return self._announce_winner_and_close_locked(room, reason="其他玩家已全部出局"), done_msg
+
+        declared = CARD_NAME.get(room.target_card, room.target_card)
+        card_count = len(played_cards)
+        pname = self._display_player_name(room, user_id)
+        next_name = self._display_player_name(room, next_uid)
+        next_player = room.players.get(next_uid)
+        if next_player and next_player.is_ai:
+            step = f"现在由 {next_name} 行动，系统将自动执行；其他玩家请等待结算。"
+        else:
+            step = f"现在由 {next_name} 决定：群里 /酒馆 质疑，或在私聊直接出牌。"
+
+        announce = f"{pname} 已暗出 {card_count} 张，并宣称【{declared}】。"
+        if taunt_line:
+            announce = f"{announce}\n{taunt_line}"
+
+        update.outbox.append((room.group_umo, [Comp.Plain(self._guide(announce, step))]))
+
+        if len(player.hand) == 0:
+            room.current_turn_user_id = next_uid
+            update.outbox.append((room.group_umo, [Comp.Plain(f"{pname} 已出完手牌，系统自动触发下家质疑。")]))
+            challenge_update = self._resolve_challenge_locked(room, next_uid, auto=True)
+            update.outbox.extend(challenge_update.outbox)
+            update.hand_push.extend(challenge_update.hand_push)
+        else:
+            room.current_turn_user_id = next_uid
+            room.phase = PHASE_PLAYING
+            room.pending_wire_user_id = ""
+            room.wire_options = []
+            room.wire_index_map = {}
+            room.wire_deadline_ts = 0
+            room.action_token += 1
+            room.play_deadline_ts = time.time() + self._play_timeout_seconds()
+            self._arm_play_timeout_task(room.room_id, room.action_token, room.current_turn_user_id, room.play_deadline_ts)
+            if not player.is_ai:
+                update.hand_push.append(user_id)
+                done_msg = self._guide(
+                    f"已提交：你本次暗出 {card_count} 张。",
+                    "等待群内结算，或稍后再用 /酒馆 手牌 查看最新手牌。",
+                )
+
+        return update, done_msg
+
     def _resolve_challenge_locked(self, room: RoomState, challenger_id: str, auto: bool) -> RoundUpdate:
         update = RoundUpdate()
         if not room.last_play:
@@ -1281,8 +1521,8 @@ class LiarsBarBasicPlugin(Star):
         liar = any(card not in {room.target_card, CARD_MAGIC} for card in last.cards)
         punished_id = last.player_id if liar else challenger_id
 
-        revealer = room.players.get(last.player_id).name if last.player_id in room.players else last.player_id
-        challenger = room.players.get(challenger_id).name if challenger_id in room.players else challenger_id
+        revealer = self._display_player_name(room, last.player_id)
+        challenger = self._display_player_name(room, challenger_id)
         revealed_cards = "、".join(CARD_NAME.get(c, c) for c in last.cards)
 
         if liar:
@@ -1318,24 +1558,41 @@ class LiarsBarBasicPlugin(Star):
         self._arm_wire_timeout_task(room.room_id, room.action_token, punished_id, room.wire_deadline_ts)
 
         options_text = " / ".join([f"{k}={v}" for k, v in room.wire_index_map.items()])
-        pname = punished.name
+        pname = self._display_player_name(room, punished_id)
 
         bomb_img = self.renderer.bomb_path_for_options(room.wire_options)
-        chain: list[Any] = [Comp.At(qq=punished_id), Comp.Plain(f" {pname} 进入剪线阶段。可选：{options_text}\n")]
+        chain: list[Any] = []
+        if punished.is_ai:
+            chain.append(Comp.Plain(f"{pname} 进入剪线阶段。可选：{options_text}\n"))
+        else:
+            chain.append(Comp.At(qq=punished_id))
+            chain.append(Comp.Plain(f" {pname} 进入剪线阶段。可选：{options_text}\n"))
         if bomb_img and bomb_img.exists():
             chain.append(Comp.Image.fromFileSystem(str(bomb_img)))
+        step = (
+            "系统将自动为 AI 执行剪线。"
+            if punished.is_ai
+            else "受罚玩家请发送 /酒馆 剪线 红|蓝|黄（也支持数字 1/2/3）。"
+        )
         chain.append(
             Comp.Plain(
                 self._guide(
                     "",
-                    "受罚玩家请发送 /酒馆 剪线 红|蓝|黄（也支持数字 1/2/3）。",
+                    step,
                 )
             )
         )
         update.outbox.append((room.group_umo, chain))
         return update
 
-    def _apply_wire_cut_locked(self, room: RoomState, user_id: str, color: str, by_timeout: bool) -> RoundUpdate:
+    def _apply_wire_cut_locked(
+        self,
+        room: RoomState,
+        user_id: str,
+        color: str,
+        by_timeout: bool,
+        taunt_line: str = "",
+    ) -> RoundUpdate:
         update = RoundUpdate()
         player = room.players.get(user_id)
         if not player:
@@ -1357,13 +1614,16 @@ class LiarsBarBasicPlugin(Star):
         room.wire_deadline_ts = 0
         self._cancel_wire_timeout_task(room.room_id)
 
-        who = player.name
+        who = self._display_player_name(room, user_id)
         prefix = "[超时自动剪线] " if by_timeout else ""
 
         if exploded:
             player.alive = False
             player.hand = []
-            chain: list[Any] = [Comp.Plain(f"{prefix}{who} 剪到【{color}线】并触发爆炸，已出局。")]
+            text = f"{prefix}{who} 剪到【{color}线】并触发爆炸，已出局。"
+            if taunt_line:
+                text = f"{text}\n{taunt_line}"
+            chain: list[Any] = [Comp.Plain(text)]
             explode = self.renderer.bomb_explode_path()
             if explode.exists():
                 chain.append(Comp.Image.fromFileSystem(str(explode)))
@@ -1371,13 +1631,16 @@ class LiarsBarBasicPlugin(Star):
             update.outbox.append((room.group_umo, chain))
         else:
             remain = "、".join(player.wires_remaining)
+            text = f"{prefix}{who} 剪到【{color}线】并安全通过。剩余线：{remain}"
+            if taunt_line:
+                text = f"{text}\n{taunt_line}"
             update.outbox.append(
                 (
                     room.group_umo,
                     [
                         Comp.Plain(
                             self._guide(
-                                f"{prefix}{who} 剪到【{color}线】并安全通过。剩余线：{remain}",
+                                text,
                                 "本小局结束，系统将开始下一小局。",
                             )
                         )
@@ -1459,7 +1722,7 @@ class LiarsBarBasicPlugin(Star):
             )
         )
         update.outbox.append((room.group_umo, chain))
-        update.hand_push.extend(alive_ids)
+        update.hand_push.extend([uid for uid in alive_ids if uid in room.players and not room.players[uid].is_ai])
         return update
 
     def _announce_winner_and_close_locked(self, room: RoomState, reason: str) -> RoundUpdate:
@@ -1467,7 +1730,7 @@ class LiarsBarBasicPlugin(Star):
         alive_ids = room.alive_ids()
         if alive_ids:
             winner_id = alive_ids[0]
-            winner_name = room.players.get(winner_id).name if winner_id in room.players else winner_id
+            winner_name = self._display_player_name(room, winner_id)
             text = self._guide(
                 f"大局结束：{winner_name} 获胜。\n原因：{reason}",
                 "如需再玩，请发送 /酒馆 开房。",
@@ -1481,6 +1744,8 @@ class LiarsBarBasicPlugin(Star):
     async def _send_private_hand(self, room: RoomState, user_id: str, force_tip: bool) -> None:
         player = room.players.get(user_id)
         if not player:
+            return
+        if player.is_ai:
             return
 
         if not player.alive:
@@ -1536,8 +1801,10 @@ class LiarsBarBasicPlugin(Star):
             "5) 受罚进入剪线：三选一 -> 二选一 -> 一选一必爆\n6) 命令：/酒馆 剪线 红|蓝|黄（支持数字）",
             f"7) 超时：出牌{play_timeout}秒超时直接整局淘汰；剪线{wire_timeout}秒超时自动剪线",
             "8) 若玩家出完手牌，下家会被系统自动触发质疑",
-            "9) 全程一人一房，避免私聊串局\n10) 所有命令可随时用 /酒馆 帮助 查询",
-            f"11) 本大局牌池在开局时一次锁定，后续小局不变化。\n{pool_text}",
+            "9) 全程一人一房，避免私聊串局",
+            "10) 等待阶段房主可 /酒馆 加AI 或 /酒馆 减AI，AI 会自动行动",
+            "11) 所有命令可随时用 /酒馆 帮助 查询",
+            f"12) 本大局牌池在开局时一次锁定，后续小局不变化。\n{pool_text}",
         ]
 
         try:
@@ -1573,16 +1840,19 @@ class LiarsBarBasicPlugin(Star):
             room.play_deadline_ts = 0
             self._cancel_play_timeout_task(room_id)
 
+            timeout_text = (
+                f"{self._display_player_name(room, target_uid)} 出牌超时 {self._play_timeout_seconds()} 秒，直接整局淘汰。\n"
+                + self._guide("", "本小局结束，系统将自动开始下一小局。")
+            )
+            timeout_chain: list[Any]
+            if player.is_ai:
+                timeout_chain = [Comp.Plain(timeout_text)]
+            else:
+                timeout_chain = [Comp.At(qq=target_uid), Comp.Plain(f" {timeout_text}")]
             update.outbox.append(
                 (
                     room.group_umo,
-                    [
-                        Comp.At(qq=target_uid),
-                        Comp.Plain(
-                            f" 出牌超时 {self._play_timeout_seconds()} 秒，直接整局淘汰。\n"
-                            + self._guide("", "本小局结束，系统将自动开始下一小局。")
-                        ),
-                    ],
+                    timeout_chain,
                 )
             )
 
@@ -1674,6 +1944,15 @@ class LiarsBarBasicPlugin(Star):
         if task and task is not current_task:
             task.cancel()
 
+    def _cancel_ai_action_task_locked(self, room_id: str) -> None:
+        task = self.ai_action_tasks.pop(room_id, None)
+        self.ai_action_task_tokens.pop(room_id, None)
+        current_task: Optional[asyncio.Task] = None
+        with contextlib.suppress(RuntimeError):
+            current_task = asyncio.current_task()
+        if task and task is not current_task:
+            task.cancel()
+
     def _drop_room_locked(self, room_id: str) -> None:
         room = self.rooms.pop(room_id, None)
         if not room:
@@ -1681,6 +1960,7 @@ class LiarsBarBasicPlugin(Star):
 
         self._cancel_play_timeout_task(room_id)
         self._cancel_wire_timeout_task(room_id)
+        self._cancel_ai_action_task_locked(room_id)
 
         for uid, rid in list(self.player_room_index.items()):
             if rid == room_id:
@@ -1744,20 +2024,23 @@ class LiarsBarBasicPlugin(Star):
     async def _dispatch_round_update(self, room_snapshot: Optional[RoomState], update: RoundUpdate) -> None:
         if update.outbox:
             await self._flush_outbox(update.outbox)
-        if not room_snapshot or not update.hand_push:
-            return
-
-        for uid in update.hand_push:
-            try:
-                await self._send_private_hand(room_snapshot, uid, force_tip=False)
-            except Exception:
-                await self._send_to_umo(
-                    room_snapshot.group_umo,
-                    [
-                        Comp.At(qq=uid),
-                        Comp.Plain(" 私聊发牌失败，请先加好友并私聊机器人一次。"),
-                    ],
-                )
+        if room_snapshot and update.hand_push:
+            for uid in update.hand_push:
+                player = room_snapshot.players.get(uid)
+                if player and player.is_ai:
+                    continue
+                try:
+                    await self._send_private_hand(room_snapshot, uid, force_tip=False)
+                except Exception:
+                    await self._send_to_umo(
+                        room_snapshot.group_umo,
+                        [
+                            Comp.At(qq=uid),
+                            Comp.Plain(" 私聊发牌失败，请先加好友并私聊机器人一次。"),
+                        ],
+                    )
+        if room_snapshot:
+            await self._kick_ai_if_needed(room_snapshot.room_id)
 
     async def _send_group_text(self, room: RoomState, text: str) -> None:
         await self._send_to_umo(room.group_umo, [Comp.Plain(text)])
@@ -1790,21 +2073,84 @@ class LiarsBarBasicPlugin(Star):
         idx = alive.index(user_id)
         return alive[(idx + 1) % len(alive)]
 
-    def _parse_indices(self, args: list[str], max_size: int) -> list[int] | str:
+    def _display_player_name(self, room: RoomState, user_id: str) -> str:
+        player = room.players.get(user_id)
+        if not player:
+            return user_id
+        if player.is_ai:
+            return f"{player.name}[AI]"
+        return player.name
+
+    def _parse_count_arg(self, args: list[str], default: int) -> Optional[int]:
+        if not args:
+            return default
+        raw = args[0].strip()
+        if not re.fullmatch(r"\d+", raw):
+            return None
+        value = int(raw)
+        if value <= 0:
+            return None
+        return value
+
+    def _alloc_ai_identity_locked(self, room: RoomState) -> tuple[str, str]:
+        used_names = {player.name for player in room.players.values()}
+        while True:
+            room.ai_seq += 1
+            ai_name = f"AI-{room.ai_seq}"
+            if ai_name not in used_names:
+                break
+        ai_uid = f"ai:{room.room_id}:{room.ai_seq}:{random.randint(1000, 9999)}"
+        while ai_uid in room.players:
+            ai_uid = f"ai:{room.room_id}:{room.ai_seq}:{random.randint(1000, 9999)}"
+        return ai_uid, ai_name
+
+    def _normalize_indices(self, raw_values: list[Any], max_size: int, max_cards: Optional[int] = None) -> Optional[list[int]]:
         values: list[int] = []
-        for item in args:
-            if not re.fullmatch(r"\d+", item):
-                return "序号必须是正整数。"
-            values.append(int(item))
+        for item in raw_values:
+            if isinstance(item, bool):
+                return None
+            if isinstance(item, int):
+                values.append(item)
+                continue
+            if isinstance(item, float):
+                if int(item) != item:
+                    return None
+                values.append(int(item))
+                continue
+            if isinstance(item, str):
+                text = item.strip()
+                if not re.fullmatch(r"\d+", text):
+                    return None
+                values.append(int(text))
+                continue
+            return None
+
         if not values:
-            return "请至少提供一个序号。"
+            return None
         if len(values) != len(set(values)):
-            return "序号不能重复。"
+            return None
         if any(v <= 0 for v in values):
-            return "序号必须大于 0。"
+            return None
         if any(v > max_size for v in values):
-            return f"存在越界序号，当前手牌只有 {max_size} 张。"
+            return None
+        if max_cards is not None and len(values) > max_cards:
+            return None
         return sorted(values)
+
+    def _parse_indices(self, args: list[str], max_size: int) -> list[int] | str:
+        if not args:
+            return "请至少提供一个序号。"
+        parsed = self._normalize_indices(args, max_size)
+        if parsed is None:
+            for item in args:
+                if not re.fullmatch(r"\d+", str(item).strip()):
+                    return "序号必须是正整数。"
+            if len(args) != len(set(args)):
+                return "序号不能重复。"
+            if any(int(item) <= 0 for item in args):
+                return "序号必须大于 0。"
+            return f"存在越界序号，当前手牌只有 {max_size} 张。"
+        return parsed
 
     def _resolve_wire_arg(self, raw: str, room: RoomState) -> Optional[str]:
         text = raw.strip().lower()
@@ -1817,6 +2163,357 @@ class LiarsBarBasicPlugin(Star):
             if picked in room.wire_options:
                 return picked
         return None
+
+    async def _resume_ai_actions(self) -> None:
+        async with self.state_lock:
+            room_ids = list(self.rooms.keys())
+        for room_id in room_ids:
+            await self._kick_ai_if_needed(room_id)
+
+    async def _kick_ai_if_needed(self, room_id: str) -> None:
+        if not self._ai_enabled():
+            async with self.state_lock:
+                self._cancel_ai_action_task_locked(room_id)
+            return
+
+        async with self.state_lock:
+            room = self.rooms.get(room_id)
+            if not room:
+                self._cancel_ai_action_task_locked(room_id)
+                return
+
+            should_run = False
+            if room.phase == PHASE_PLAYING:
+                actor = room.players.get(room.current_turn_user_id)
+                should_run = bool(actor and actor.is_ai and actor.alive)
+            elif room.phase == PHASE_AWAIT_WIRE:
+                actor = room.players.get(room.pending_wire_user_id)
+                should_run = bool(actor and actor.is_ai and actor.alive)
+
+            if not should_run:
+                self._cancel_ai_action_task_locked(room_id)
+                return
+
+            token = room.action_token
+            running = self.ai_action_tasks.get(room_id)
+            running_token = self.ai_action_task_tokens.get(room_id)
+            if running and not running.done() and running_token == token:
+                return
+
+            self._cancel_ai_action_task_locked(room_id)
+            task = asyncio.create_task(self._run_ai_action(room_id, token))
+            self.ai_action_tasks[room_id] = task
+            self.ai_action_task_tokens[room_id] = token
+
+            def _done(done_task: asyncio.Task) -> None:
+                current = self.ai_action_tasks.get(room_id)
+                if current is done_task:
+                    self.ai_action_tasks.pop(room_id, None)
+                    self.ai_action_task_tokens.pop(room_id, None)
+                try:
+                    done_task.result()
+                except asyncio.CancelledError:
+                    pass
+                except Exception as exc:
+                    logger.error(f"酒馆AI任务异常: room={room_id}, token={token}, err={exc}")
+
+            task.add_done_callback(_done)
+
+    async def _run_ai_action(self, room_id: str, token: int) -> None:
+        phase = ""
+        ai_uid = ""
+        snapshot: Optional[RoomState] = None
+        async with self.state_lock:
+            room = self.rooms.get(room_id)
+            if not room or room.action_token != token:
+                return
+            if room.phase == PHASE_PLAYING:
+                actor = room.players.get(room.current_turn_user_id)
+                if not actor or not actor.is_ai or not actor.alive:
+                    return
+                phase = PHASE_PLAYING
+                ai_uid = room.current_turn_user_id
+                snapshot = copy.deepcopy(room)
+            elif room.phase == PHASE_AWAIT_WIRE:
+                actor = room.players.get(room.pending_wire_user_id)
+                if not actor or not actor.is_ai or not actor.alive:
+                    return
+                phase = PHASE_AWAIT_WIRE
+                ai_uid = room.pending_wire_user_id
+                snapshot = copy.deepcopy(room)
+            else:
+                return
+
+        if not snapshot:
+            return
+
+        decision: dict[str, Any] = {}
+        if phase == PHASE_PLAYING:
+            decision = await self._decide_ai_action(snapshot, ai_uid)
+        else:
+            options = snapshot.wire_options.copy()
+            if options:
+                decision = {"action": "wire", "color": random.choice(options)}
+            else:
+                decision = {"action": "wire", "color": ""}
+
+        update = RoundUpdate()
+        room_snapshot: Optional[RoomState] = None
+        changed = False
+
+        async with self.state_lock:
+            room = self.rooms.get(room_id)
+            if not room or room.action_token != token:
+                return
+
+            if phase == PHASE_PLAYING:
+                player = room.players.get(ai_uid)
+                if room.phase != PHASE_PLAYING or room.current_turn_user_id != ai_uid or not player or not player.is_ai or not player.alive:
+                    return
+
+                action = str(decision.get("action", "")).lower()
+                if action == "challenge" and room.last_play:
+                    taunt_line = self._build_ai_taunt_line(room, ai_uid, "challenge")
+                    title = f"{self._display_player_name(room, ai_uid)} 选择了质疑。"
+                    if taunt_line:
+                        title = f"{title}\n{taunt_line}"
+                    update.outbox.append((room.group_umo, [Comp.Plain(title)]))
+                    decision_update = self._resolve_challenge_locked(room, ai_uid, auto=False)
+                    update.outbox.extend(decision_update.outbox)
+                    update.hand_push.extend(decision_update.hand_push)
+                    changed = True
+                else:
+                    norm = self._normalize_indices(
+                        list(decision.get("indices", []) or []),
+                        len(player.hand),
+                        max_cards=min(self._ai_max_play_cards(), len(player.hand)),
+                    )
+                    if not norm:
+                        fallback = self._fallback_ai_decision(room, ai_uid)
+                        norm = self._normalize_indices(
+                            list(fallback.get("indices", []) or []),
+                            len(player.hand),
+                            max_cards=min(self._ai_max_play_cards(), len(player.hand)),
+                        )
+                    if not norm:
+                        if room.last_play:
+                            taunt_line = self._build_ai_taunt_line(room, ai_uid, "challenge")
+                            title = f"{self._display_player_name(room, ai_uid)} 选择了质疑。"
+                            if taunt_line:
+                                title = f"{title}\n{taunt_line}"
+                            update.outbox.append((room.group_umo, [Comp.Plain(title)]))
+                            decision_update = self._resolve_challenge_locked(room, ai_uid, auto=False)
+                            update.outbox.extend(decision_update.outbox)
+                            update.hand_push.extend(decision_update.hand_push)
+                            changed = True
+                        else:
+                            repair = self._start_new_round_locked(room, reason="AI动作状态修复")
+                            update.outbox.extend(repair.outbox)
+                            update.hand_push.extend(repair.hand_push)
+                            changed = True
+                    else:
+                        taunt_line = self._build_ai_taunt_line(room, ai_uid, "play")
+                        decision_update, _ = self._apply_play_locked(room, ai_uid, norm, taunt_line=taunt_line)
+                        update.outbox.extend(decision_update.outbox)
+                        update.hand_push.extend(decision_update.hand_push)
+                        changed = True
+            else:
+                player = room.players.get(ai_uid)
+                if room.phase != PHASE_AWAIT_WIRE or room.pending_wire_user_id != ai_uid or not player or not player.is_ai or not player.alive:
+                    return
+                picked = str(decision.get("color", "")).strip()
+                if picked not in room.wire_options and room.wire_options:
+                    picked = random.choice(room.wire_options)
+                if not picked and room.wire_options:
+                    picked = random.choice(room.wire_options)
+                if not picked:
+                    repair = self._start_new_round_locked(room, reason="AI剪线状态修复")
+                    update.outbox.extend(repair.outbox)
+                    update.hand_push.extend(repair.hand_push)
+                    changed = True
+                else:
+                    taunt_line = self._build_ai_taunt_line(room, ai_uid, "wire")
+                    decision_update = self._apply_wire_cut_locked(room, ai_uid, picked, by_timeout=False, taunt_line=taunt_line)
+                    update.outbox.extend(decision_update.outbox)
+                    update.hand_push.extend(decision_update.hand_push)
+                    changed = True
+
+            if changed:
+                room.updated_at = time.time()
+                await self._save_state_locked()
+                if room.room_id in self.rooms:
+                    room_snapshot = copy.deepcopy(room)
+
+        if changed:
+            await self._dispatch_round_update(room_snapshot, update)
+
+    async def _decide_ai_action(self, room: RoomState, ai_uid: str) -> dict[str, Any]:
+        fallback = self._fallback_ai_decision(room, ai_uid)
+        provider_id = self._ai_provider_id()
+        if not provider_id:
+            return fallback
+
+        provider = self.context.get_provider_by_id(provider_id)
+        if not provider:
+            logger.warning(f"酒馆AI未找到指定 Provider: {provider_id}，改用规则策略。")
+            return fallback
+
+        prompt = self._build_ai_prompt(room, ai_uid)
+        attempts = self._ai_llm_retry_times() + 1
+        for _ in range(attempts):
+            try:
+                response = await asyncio.wait_for(
+                    provider.text_chat(prompt=prompt, session_id=None, contexts=[]),
+                    timeout=self._ai_llm_timeout_seconds(),
+                )
+                text = str(getattr(response, "completion_text", "") or "")
+                parsed = self._parse_ai_llm_decision(text, room, ai_uid)
+                if parsed:
+                    return parsed
+            except Exception as exc:
+                logger.warning(f"酒馆AI调用 Provider 失败，改用规则策略: {exc}")
+        return fallback
+
+    def _build_ai_prompt(self, room: RoomState, ai_uid: str) -> str:
+        player = room.players.get(ai_uid)
+        hand = list(player.hand) if player else []
+        readable_hand = [f"{idx + 1}:{CARD_NAME.get(card, card)}" for idx, card in enumerate(hand)]
+        alive = room.alive_ids()
+        roster = []
+        for uid in room.order:
+            p = room.players.get(uid)
+            if not p:
+                continue
+            status = "出局" if not p.alive else "存活"
+            roster.append(f"{self._display_player_name(room, uid)}({status}, 手牌{len(p.hand)})")
+
+        lines = [
+            "你是骗子酒馆的 AI 玩家，只输出 JSON，不要解释。",
+            f"当前目标牌：{CARD_NAME.get(room.target_card, room.target_card)}；魔术牌可当目标牌。",
+            f"你的手牌：{', '.join(readable_hand) if readable_hand else '空'}",
+            f"存活人数：{len(alive)}，玩家列表：{'；'.join(roster)}",
+        ]
+        if room.last_play:
+            lines.append(
+                f"上一手：{self._display_player_name(room, room.last_play.player_id)} 宣称出了 {len(room.last_play.cards)} 张目标牌。"
+            )
+            lines.append(
+                f"你可选动作：challenge 或 play。play 最多 {min(self._ai_max_play_cards(), max(1, len(hand)))} 张。"
+            )
+        else:
+            lines.append(
+                f"你可选动作：仅 play。play 最多 {min(self._ai_max_play_cards(), max(1, len(hand)))} 张。"
+            )
+        lines.append('输出格式：{"action":"play","indices":[1,2]} 或 {"action":"challenge"}')
+        return "\n".join(lines)
+
+    def _parse_ai_llm_decision(self, text: str, room: RoomState, ai_uid: str) -> Optional[dict[str, Any]]:
+        if not text:
+            return None
+        data = self._extract_json_dict(text)
+        if not data:
+            return None
+
+        action = str(data.get("action", "")).strip().lower()
+        player = room.players.get(ai_uid)
+        hand_size = len(player.hand) if player else 0
+
+        if action == "challenge":
+            if room.last_play:
+                return {"action": "challenge"}
+            return None
+
+        if action == "play":
+            indices_raw = data.get("indices")
+            if not isinstance(indices_raw, list):
+                return None
+            normalized = self._normalize_indices(
+                indices_raw,
+                hand_size,
+                max_cards=min(self._ai_max_play_cards(), max(1, hand_size)),
+            )
+            if not normalized:
+                return None
+            return {"action": "play", "indices": normalized}
+        return None
+
+    def _extract_json_dict(self, text: str) -> Optional[dict[str, Any]]:
+        content = text.strip()
+        fence = re.search(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", content, flags=re.IGNORECASE)
+        candidates = [fence.group(1)] if fence else []
+        candidates.append(content)
+        brace = re.search(r"\{[\s\S]*\}", content)
+        if brace:
+            candidates.append(brace.group(0))
+
+        for candidate in candidates:
+            try:
+                data = json.loads(candidate)
+                if isinstance(data, dict):
+                    return data
+            except Exception:
+                continue
+        return None
+
+    def _fallback_ai_decision(self, room: RoomState, ai_uid: str) -> dict[str, Any]:
+        player = room.players.get(ai_uid)
+        if not player:
+            return {"action": "challenge"} if room.last_play else {"action": "play", "indices": [1]}
+
+        hand = list(player.hand)
+        hand_size = len(hand)
+        if hand_size <= 0:
+            return {"action": "challenge"} if room.last_play else {"action": "play", "indices": [1]}
+
+        truth_indices = [idx + 1 for idx, card in enumerate(hand) if card in {room.target_card, CARD_MAGIC}]
+        fake_indices = [idx + 1 for idx, card in enumerate(hand) if card not in {room.target_card, CARD_MAGIC}]
+
+        if room.last_play:
+            claim_count = len(room.last_play.cards)
+            alive_n = len(room.alive_ids())
+            challenge_prob = 0.18
+            challenge_prob += min(0.24, claim_count * 0.08)
+            if not truth_indices:
+                challenge_prob += 0.22
+            if alive_n <= 3:
+                challenge_prob += 0.10
+            challenge_prob = max(0.06, min(0.82, challenge_prob))
+            if random.random() < challenge_prob:
+                return {"action": "challenge"}
+
+        max_play = min(self._ai_max_play_cards(), hand_size)
+        play_count = random.randint(1, max_play)
+        chosen: list[int] = []
+
+        if truth_indices:
+            pick_truth = min(len(truth_indices), play_count)
+            if fake_indices and play_count > 1 and room.last_play and random.random() < 0.35:
+                pick_truth = max(1, pick_truth - 1)
+            chosen.extend(random.sample(truth_indices, k=pick_truth))
+
+        remaining_slots = play_count - len(chosen)
+        remaining_pool = [idx for idx in range(1, hand_size + 1) if idx not in chosen]
+        if remaining_slots > 0 and remaining_pool:
+            chosen.extend(random.sample(remaining_pool, k=min(remaining_slots, len(remaining_pool))))
+
+        if not chosen:
+            chosen = random.sample(list(range(1, hand_size + 1)), k=min(play_count, hand_size))
+        return {"action": "play", "indices": sorted(chosen)}
+
+    def _build_ai_taunt_line(self, room: RoomState, ai_uid: str, action: str) -> str:
+        if not self._ai_taunt_enabled():
+            return ""
+        if random.random() > self._ai_taunt_probability():
+            return ""
+        pool = AI_TAUNTS.get(action, [])
+        if not pool:
+            return ""
+        text = random.choice(pool).strip()
+        if len(text) > 20:
+            text = text[:20]
+        if not text:
+            return ""
+        return f"{self._display_player_name(room, ai_uid)}：{text}"
 
     def _phase_label(self, phase: str) -> str:
         return {
@@ -1880,6 +2577,8 @@ class LiarsBarBasicPlugin(Star):
             "群指令：\n"
             "- /酒馆 开房：创建房间，发起者自动房主\n"
             "- /酒馆 加入：加入本群房间（3~5人可开）\n"
+            "- /酒馆 加AI [数量]：仅房主，等待阶段可加 AI（总人数不超5）\n"
+            "- /酒馆 减AI [数量]：仅房主，等待阶段可减 AI\n"
             "- /酒馆 开始：房主开局\n"
             "- /酒馆 状态：查看阶段/轮次/当前行动\n"
             "- /酒馆 质疑：质疑上一手\n"
@@ -1898,7 +2597,8 @@ class LiarsBarBasicPlugin(Star):
             "1) 私聊不可达：请先加好友并私聊机器人一次\n"
             "2) 一人一房：同一时间只能在一个群房间中\n"
             "3) 非当前回合：请先 /酒馆 状态 查看行动人\n"
-            "4) 私聊不能开房/加入：这类命令只能在群聊使用\n\n"
+            "4) 私聊不能开房/加入/加AI：这类命令只能在群聊使用\n"
+            "5) AI 模型不可用时会自动降级为规则 AI，不会卡死对局\n\n"
             "下一步：在群里发送 /酒馆 开房 开始游戏。"
         )
 
@@ -1911,7 +2611,7 @@ class LiarsBarBasicPlugin(Star):
             "1) 只有轮到你时才能出牌\n"
             "2) 可一次出多张，序号不可重复\n"
             "3) 出牌后去群里看质疑/结算\n"
-            "4) 开房/加入/开始/质疑/剪线/结束必须在群里执行\n\n"
+            "4) 开房/加入/加AI/减AI/开始/质疑/剪线/结束必须在群里执行\n\n"
             "下一步：先发送 /酒馆 手牌 查看当前序号。"
         )
 
@@ -1934,16 +2634,13 @@ class LiarsBarBasicPlugin(Star):
             loaded_rooms[room.room_id] = room
 
         self.rooms = loaded_rooms
-        self.player_room_index = {
-            str(uid): str(rid)
-            for uid, rid in (raw.get("player_room_index", {}) or {}).items()
-            if str(rid) in self.rooms
-        }
-
-        # rebuild index to avoid stale mapping
+        self.player_room_index = {}
+        # rebuild index from room state to avoid stale mapping
         for room in self.rooms.values():
             for uid in room.order:
-                self.player_room_index[str(uid)] = room.room_id
+                player = room.players.get(uid)
+                if player and not player.is_ai:
+                    self.player_room_index[str(uid)] = room.room_id
 
     def _normalize_room_state(self, room: RoomState) -> None:
         # Keep order/player structures consistent even if persisted state is edited or partially corrupted.
@@ -1958,9 +2655,40 @@ class LiarsBarBasicPlugin(Star):
             cleaned_order = [str(uid) for uid in room.players.keys()]
         room.order = cleaned_order
 
+        used_ai_names: set[str] = set()
+        max_ai_seq = max(0, int(room.ai_seq))
+        for uid in room.order:
+            player = room.players.get(uid)
+            if not player:
+                continue
+            player.user_id = uid
+            if player.is_ai:
+                label = player.ai_label or player.name
+                match = re.search(r"AI-(\d+)", label)
+                if match:
+                    max_ai_seq = max(max_ai_seq, int(match.group(1)))
+                if not label.startswith("AI-"):
+                    max_ai_seq += 1
+                    label = f"AI-{max_ai_seq}"
+                if label in used_ai_names:
+                    max_ai_seq += 1
+                    label = f"AI-{max_ai_seq}"
+                used_ai_names.add(label)
+                player.ai_label = label
+                player.name = label
+                player.dm_reachable = True
+            else:
+                player.ai_label = ""
+        room.ai_seq = max_ai_seq
+
         if room.owner_id not in room.players and room.order:
             room.owner_id = room.order[0]
             room.owner_name = room.players[room.owner_id].name
+        if room.owner_id in room.players and room.players[room.owner_id].is_ai:
+            human_owner = next((uid for uid in room.order if uid in room.players and not room.players[uid].is_ai), "")
+            if human_owner:
+                room.owner_id = human_owner
+                room.owner_name = room.players[human_owner].name
 
         if room.current_turn_user_id and room.current_turn_user_id not in room.players:
             room.current_turn_user_id = room.order[0] if room.order else ""
