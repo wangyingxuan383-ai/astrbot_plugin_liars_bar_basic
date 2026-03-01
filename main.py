@@ -60,19 +60,19 @@ FIXED_HAND_SIZE = 5
 DEFAULT_AI_LLM_TIMEOUT_SECONDS = 12
 DEFAULT_AI_LLM_RETRY_TIMES = 1
 DEFAULT_AI_MAX_PLAY_CARDS = 3
-DEFAULT_AI_TAUNT_PROBABILITY = 0.35
-DECK_DISTRIBUTION_WEIGHTS = {
-    CARD_SUN: 3,
-    CARD_MOON: 3,
-    CARD_STAR: 3,
-    CARD_MAGIC: 1,
-}
+DEFAULT_AI_TAUNT_PROBABILITY = 1.0
 
 PHASE_WAITING = "waiting"
 PHASE_PLAYING = "playing"
 PHASE_AWAIT_WIRE = "await_wire"
 
 AI_TAUNTS = {
+    "turn_start": [
+        "我先动手了。",
+        "我来开这手。",
+        "先看我这轮。",
+        "这一回合由我来。",
+    ],
     "play": [
         "这手够你想一会了。",
         "杯沿已敲，轮到你了。",
@@ -91,6 +91,13 @@ AI_TAUNTS = {
         "我剪这一根。",
         "听天由命吧。",
     ],
+}
+
+AI_TAUNTS_MINIMAL = {
+    "turn_start": ["我先来。"],
+    "play": ["我出牌了。"],
+    "challenge": ["我质疑。"],
+    "wire": ["我来剪。"],
 }
 
 try:
@@ -660,6 +667,7 @@ class LiarsBarBasicPlugin(Star):
         self.wire_timeout_tasks: dict[str, asyncio.Task] = {}
         self.ai_action_tasks: dict[str, asyncio.Task] = {}
         self.ai_action_task_tokens: dict[str, int] = {}
+        self._warn_cooldowns: dict[str, float] = {}
         self.cleanup_task: Optional[asyncio.Task] = None
 
         self._load_state()
@@ -717,28 +725,23 @@ class LiarsBarBasicPlugin(Star):
         return max(1, int(self.conf.get("ai_max_play_cards", DEFAULT_AI_MAX_PLAY_CARDS)))
 
     def _build_locked_deck_counts(self, start_player_count: int) -> dict[str, int]:
-        # Lock total cards at game start: players * 5.
         players = max(3, min(5, int(start_player_count)))
-        total = players * FIXED_HAND_SIZE
-        weights = DECK_DISTRIBUTION_WEIGHTS
-        cards = [CARD_SUN, CARD_MOON, CARD_STAR, CARD_MAGIC]
-        weight_sum = sum(weights.values())
-
-        raw: dict[str, float] = {}
-        counts: dict[str, int] = {}
-        for card in cards:
-            value = total * (weights[card] / weight_sum)
-            raw[card] = value
-            counts[card] = int(value)
-
-        remain = total - sum(counts.values())
-        order = sorted(cards, key=lambda c: (raw[c] - counts[c]), reverse=True)
-        idx = 0
-        while remain > 0:
-            counts[order[idx % len(order)]] += 1
-            idx += 1
-            remain -= 1
-        return counts
+        # User-confirmed fixed pools:
+        # - 3/4 players: 6+6+6+2 (sun/moon/star/magic)
+        # - 5 players:   8+8+8+3
+        if players <= 4:
+            return {
+                CARD_SUN: 6,
+                CARD_MOON: 6,
+                CARD_STAR: 6,
+                CARD_MAGIC: 2,
+            }
+        return {
+            CARD_SUN: 8,
+            CARD_MOON: 8,
+            CARD_STAR: 8,
+            CARD_MAGIC: 3,
+        }
 
     def _build_round_deck(self, room: RoomState) -> list[str]:
         counts = room.round_deck_counts or self._build_locked_deck_counts(room.initial_player_count or len(room.order) or 4)
@@ -766,8 +769,8 @@ class LiarsBarBasicPlugin(Star):
     def _room_create_card_intro(self) -> str:
         return (
             "发牌规则：每小局先清空上局手牌，再给当前存活玩家每人固定发 5 张。"
-            "\n卡池规则：在 /酒馆 开始 时按开局人数一次锁定总牌数（3人=15张，4人=20张，5人=25张），后续小局不再改变。"
-            "\n牌型按比例分配（太阳/月亮/星星/魔术=3/3/3/1），保证每局结构稳定。"
+            "\n卡池规则：在 /酒馆 开始 时按开局人数一次锁定总牌数：3/4人=20张（6/6/6/2），5人=27张（8/8/8/3），后续小局不再改变。"
+            "\n卡池固定分配：太阳/月亮/星星/魔术，分别按 6/6/6/2 或 8/8/8/3。"
             "\nAI扩展：房主可在等待阶段使用 /酒馆 加AI [数量] 或 /酒馆 减AI [数量] 调整机器人人数。"
         )
 
@@ -1706,13 +1709,18 @@ class LiarsBarBasicPlugin(Star):
         self._cancel_wire_timeout_task(room.room_id)
 
         target_name = CARD_NAME.get(room.target_card, room.target_card)
-        starter_name = room.players.get(starter).name if starter in room.players else starter
+        starter_name = self._display_player_name(room, starter)
 
         pool_text = self._card_pool_text(room)
         chain: list[Any] = [Comp.Plain(f"第 {room.round_no} 小局开始（{reason}）。目标牌：{target_name}\n{pool_text}\n")]
         target_img = self.renderer.target_path(room.target_card)
         if target_img.exists():
             chain.append(Comp.Image.fromFileSystem(str(target_img)))
+        starter_player = room.players.get(starter)
+        if starter_player and starter_player.is_ai:
+            start_line = self._build_ai_taunt_line(room, starter, "turn_start")
+            if start_line:
+                chain.append(Comp.Plain(f"{start_line}\n"))
         chain.append(
             Comp.Plain(
                 self._guide(
@@ -1785,7 +1793,7 @@ class LiarsBarBasicPlugin(Star):
         text = "[酒馆连通检查] 收到这条消息代表私聊通道可用。"
         try:
             session = self._private_umo(platform_id, user_id)
-            await self._send_to_umo(session, [Comp.Plain(text)])
+            await self._send_to_umo(session, [Comp.Plain(text)], raise_on_fail=True)
             return True
         except Exception:
             return False
@@ -1807,11 +1815,10 @@ class LiarsBarBasicPlugin(Star):
             f"12) 本大局牌池在开局时一次锁定，后续小局不变化。\n{pool_text}",
         ]
 
-        try:
-            bot_uin = int(room.bot_id) if room.bot_id.isdigit() else int(room.owner_id)
-            nodes = [Comp.Node(uin=bot_uin, name="酒馆规则", content=[Comp.Plain(s)]) for s in sections]
-            await self._send_to_umo(room.group_umo, [Comp.Nodes(nodes=nodes)])
-        except Exception:
+        bot_uin = int(room.bot_id) if room.bot_id.isdigit() else int(room.owner_id)
+        nodes = [Comp.Node(uin=bot_uin, name="酒馆规则", content=[Comp.Plain(s)]) for s in sections]
+        ok = await self._send_to_umo(room.group_umo, [Comp.Nodes(nodes=nodes)])
+        if not ok:
             fallback = "\n\n".join(sections)
             await self._send_group_text(room, fallback)
 
@@ -2056,10 +2063,43 @@ class LiarsBarBasicPlugin(Star):
         chain: list[Any] = [Comp.Plain(text)]
         if image_path and image_path.exists():
             chain.append(Comp.Image.fromFileSystem(str(image_path)))
-        await self._send_to_umo(session, chain)
+        await self._send_to_umo(session, chain, raise_on_fail=True)
 
-    async def _send_to_umo(self, umo: str, chain: list[Any]) -> None:
-        await self.context.send_message(umo, MessageChain(chain))
+    def _warn_once(self, key: str, message: str, cooldown_seconds: int = 30) -> None:
+        now = time.time()
+        last = self._warn_cooldowns.get(key, 0.0)
+        if now - last < cooldown_seconds:
+            return
+        self._warn_cooldowns[key] = now
+        logger.warning(message)
+
+    @staticmethod
+    def _is_at_component(comp: Any) -> bool:
+        return comp.__class__.__name__.lower() == "at"
+
+    def _strip_at_components(self, chain: list[Any]) -> list[Any]:
+        return [comp for comp in chain if not self._is_at_component(comp)]
+
+    async def _send_to_umo(self, umo: str, chain: list[Any], raise_on_fail: bool = False) -> bool:
+        try:
+            await self.context.send_message(umo, MessageChain(chain))
+            return True
+        except Exception as exc:
+            if raise_on_fail:
+                raise
+            # Some QQ gateways fail hard on invalid @ targets. Retry once without @ to avoid noisy stack traces.
+            if any(self._is_at_component(comp) for comp in chain):
+                fallback_chain = self._strip_at_components(chain)
+                if fallback_chain:
+                    try:
+                        await self.context.send_message(umo, MessageChain(fallback_chain))
+                        self._warn_once("send_retry_without_at", f"酒馆消息发送失败，已降级去除@重试成功: {exc}")
+                        return True
+                    except Exception as retry_exc:
+                        self._warn_once("send_retry_failed", f"酒馆消息发送失败(重试后仍失败): {retry_exc}")
+                        return False
+            self._warn_once("send_failed", f"酒馆消息发送失败: {exc}")
+            return False
 
     def _private_umo(self, platform_id: str, user_id: str) -> str:
         return str(MessageSession(platform_id, MessageType.FRIEND_MESSAGE, str(user_id)))
@@ -2355,7 +2395,11 @@ class LiarsBarBasicPlugin(Star):
 
         provider = self.context.get_provider_by_id(provider_id)
         if not provider:
-            logger.warning(f"酒馆AI未找到指定 Provider: {provider_id}，改用规则策略。")
+            self._warn_once(
+                f"ai_provider_missing:{provider_id}",
+                f"酒馆AI未找到指定 Provider: {provider_id}，改用规则策略。",
+                cooldown_seconds=120,
+            )
             return fallback
 
         prompt = self._build_ai_prompt(room, ai_uid)
@@ -2369,9 +2413,18 @@ class LiarsBarBasicPlugin(Star):
                 text = str(getattr(response, "completion_text", "") or "")
                 parsed = self._parse_ai_llm_decision(text, room, ai_uid)
                 if parsed:
+                    if parsed.get("action") == "challenge" and room.last_play:
+                        # Even when LLM says "challenge", keep a human-like uncertainty band to avoid perfect calls.
+                        accept_prob = min(0.78, self._fair_challenge_probability(room, ai_uid, with_jitter=False) + 0.10)
+                        if random.random() > accept_prob:
+                            return self._fallback_ai_decision(room, ai_uid, allow_challenge=False)
                     return parsed
             except Exception as exc:
-                logger.warning(f"酒馆AI调用 Provider 失败，改用规则策略: {exc}")
+                self._warn_once(
+                    f"ai_provider_failed:{provider_id}",
+                    f"酒馆AI调用 Provider 失败，改用规则策略: {exc}",
+                    cooldown_seconds=30,
+                )
         return fallback
 
     def _build_ai_prompt(self, room: RoomState, ai_uid: str) -> str:
@@ -2385,10 +2438,11 @@ class LiarsBarBasicPlugin(Star):
             if not p:
                 continue
             status = "出局" if not p.alive else "存活"
-            roster.append(f"{self._display_player_name(room, uid)}({status}, 手牌{len(p.hand)})")
+            roster.append(f"{self._display_player_name(room, uid)}({status})")
 
         lines = [
             "你是骗子酒馆的 AI 玩家，只输出 JSON，不要解释。",
+            "你只能根据公开信息和你自己的手牌决策，绝不能假设看到了他人暗牌。",
             f"当前目标牌：{CARD_NAME.get(room.target_card, room.target_card)}；魔术牌可当目标牌。",
             f"你的手牌：{', '.join(readable_hand) if readable_hand else '空'}",
             f"存活人数：{len(alive)}，玩家列表：{'；'.join(roster)}",
@@ -2455,7 +2509,31 @@ class LiarsBarBasicPlugin(Star):
                 continue
         return None
 
-    def _fallback_ai_decision(self, room: RoomState, ai_uid: str) -> dict[str, Any]:
+    def _fair_challenge_probability(self, room: RoomState, ai_uid: str, with_jitter: bool = True) -> float:
+        if not room.last_play:
+            return 0.0
+        player = room.players.get(ai_uid)
+        hand = list(player.hand) if player else []
+        truth_count = sum(1 for card in hand if card in {room.target_card, CARD_MAGIC})
+        fake_count = len(hand) - truth_count
+        claim_count = len(room.last_play.cards)
+        alive_n = len(room.alive_ids())
+
+        prob = 0.12
+        prob += min(0.20, max(0, claim_count - 1) * 0.09)
+        if truth_count == 0:
+            prob += 0.10
+        elif truth_count >= 3 and claim_count <= 1:
+            prob -= 0.05
+        if fake_count == 0 and claim_count >= 2:
+            prob += 0.04
+        if alive_n <= 3:
+            prob += 0.06
+        if with_jitter:
+            prob += random.uniform(-0.10, 0.10)
+        return max(0.08, min(0.62, prob))
+
+    def _fallback_ai_decision(self, room: RoomState, ai_uid: str, allow_challenge: bool = True) -> dict[str, Any]:
         player = room.players.get(ai_uid)
         if not player:
             return {"action": "challenge"} if room.last_play else {"action": "play", "indices": [1]}
@@ -2468,16 +2546,8 @@ class LiarsBarBasicPlugin(Star):
         truth_indices = [idx + 1 for idx, card in enumerate(hand) if card in {room.target_card, CARD_MAGIC}]
         fake_indices = [idx + 1 for idx, card in enumerate(hand) if card not in {room.target_card, CARD_MAGIC}]
 
-        if room.last_play:
-            claim_count = len(room.last_play.cards)
-            alive_n = len(room.alive_ids())
-            challenge_prob = 0.18
-            challenge_prob += min(0.24, claim_count * 0.08)
-            if not truth_indices:
-                challenge_prob += 0.22
-            if alive_n <= 3:
-                challenge_prob += 0.10
-            challenge_prob = max(0.06, min(0.82, challenge_prob))
+        if allow_challenge and room.last_play:
+            challenge_prob = self._fair_challenge_probability(room, ai_uid, with_jitter=True)
             if random.random() < challenge_prob:
                 return {"action": "challenge"}
 
@@ -2503,12 +2573,16 @@ class LiarsBarBasicPlugin(Star):
     def _build_ai_taunt_line(self, room: RoomState, ai_uid: str, action: str) -> str:
         if not self._ai_taunt_enabled():
             return ""
-        if random.random() > self._ai_taunt_probability():
-            return ""
         pool = AI_TAUNTS.get(action, [])
-        if not pool:
-            return ""
-        text = random.choice(pool).strip()
+        minimal_pool = AI_TAUNTS_MINIMAL.get(action, [])
+        text = ""
+        if pool and random.random() <= self._ai_taunt_probability():
+            text = random.choice(pool).strip()
+        elif minimal_pool:
+            # Keep AI speech stable: even when probability misses, emit a short baseline line.
+            text = random.choice(minimal_pool).strip()
+        elif pool:
+            text = random.choice(pool).strip()
         if len(text) > 20:
             text = text[:20]
         if not text:
@@ -2573,7 +2647,7 @@ class LiarsBarBasicPlugin(Star):
         return (
             "【骗子酒馆基础版 帮助】\n"
             "发牌：每小局会清空上局手牌，并给当前存活玩家每人固定发 5 张；牌型=太阳/月亮/星星/魔术。\n"
-            "卡池：在开局时按人数一次锁定（3人=15张、4人=20张、5人=25张），本大局后续小局不再变化。\n\n"
+            "卡池：在开局时按人数一次锁定（3/4人=20张=6/6/6/2，5人=27张=8/8/8/3），本大局后续小局不再变化。\n\n"
             "群指令：\n"
             "- /酒馆 开房：创建房间，发起者自动房主\n"
             "- /酒馆 加入：加入本群房间（3~5人可开）\n"

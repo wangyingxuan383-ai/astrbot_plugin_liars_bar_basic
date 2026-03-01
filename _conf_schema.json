@@ -68,8 +68,8 @@
   "ai_taunt_probability": {
     "description": "AI 嘲讽概率",
     "type": "float",
-    "default": 0.35,
-    "hint": "每次 AI 动作触发简短嘲讽的概率，范围 0~1"
+    "default": 1.0,
+    "hint": "每次 AI 动作优先使用完整台词的概率，范围 0~1；未命中时仍会发送简短台词"
   },
   "ai_max_play_cards": {
     "description": "AI 单次最多出牌数",
